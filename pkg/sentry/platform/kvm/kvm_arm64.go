@@ -80,6 +80,8 @@ func updateGlobalOnce(fd int) error {
 
 	ring0.Init()
 	initFaultBlocks()
+
+	excludeVvarRegion = vvarMemslotUnusable(fd)
 	physicalInit()
 
 	// Explicitly configure address space for 48-bit VA.

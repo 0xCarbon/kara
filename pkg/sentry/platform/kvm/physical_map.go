@@ -67,7 +67,7 @@ func fillAddressSpace() (specialRegions []specialVirtualRegion) {
 	pSize -= reservedMemory
 
 	// Add specifically excluded regions; see excludeVirtualRegion.
-	if err := applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) bool {
 		if excludeVirtualRegion(vr) {
 			specialRegions = append(specialRegions, specialVirtualRegion{
 				region: vr.region,
@@ -83,6 +83,7 @@ func fillAddressSpace() (specialRegions []specialVirtualRegion) {
 		} else {
 			archSpecialRegion(vr)
 		}
+		return false // never stop
 	}); err != nil {
 		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
 	}
@@ -181,12 +182,13 @@ func fillAddressSpace() (specialRegions []specialVirtualRegion) {
 	}
 	if current == 0 {
 		log.Warningf("Filling address space failed (VirtualAddressBits=%d PhysicalAddressBits=%d vSize=%#x pSize=%#x faultBlockSize=%#x required=%#x filled=%#x); last mmap errno: %v; VMAs:", ring0.VirtualAddressBits, ring0.PhysicalAddressBits, vSize, pSize, faultBlockSize, required, filled, lastMmapErrno)
-		err := applyVirtualRegions(func(vr virtualRegion) {
+		err := applyVirtualRegions(func(vr virtualRegion) bool {
 			ps := "p"
 			if vr.shared {
 				ps = "s"
 			}
 			log.Warningf("%x-%x %v%s %08x %s", vr.region.virtual, vr.region.virtual+vr.region.length, vr.accessType, ps, vr.offset, vr.filename)
+			return false
 		})
 		if err != nil {
 			log.Warningf("Failed to get all VMAs: %v", err)
