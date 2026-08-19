@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,6 +53,7 @@ import (
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
@@ -1414,6 +1416,317 @@ func TestCheckpointRestore(t *testing.T) {
 // gofer-backed fd all complete, and the main loop keeps running. (The read
 // has data pre-seeded, so this verifies post-restore fd state and delivery,
 // not blocking semantics.)
+// procDead reports whether the given pid is gone or a zombie.
+func procDead(pid int) bool {
+	if err := syscall.Kill(pid, 0); err != nil {
+		return true
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true
+	}
+	// The state is the field after the parenthesized comm; find the last ')'.
+	if i := bytes.LastIndexByte(data, ')'); i >= 0 && i+2 < len(data) {
+		return data[i+2] == 'Z'
+	}
+	return false
+}
+
+// TestCheckpointCleansImageWhenSandboxDies reproduces the failure mode behind
+// the checkpoint-image-truncation ticket (wave-04): when the sandbox dies
+// before the checkpoint RPC completes (observed in the wild as "urpc method
+// ... failed: EOF" from a sandbox that exited mid-save, e.g. after a sentry
+// panic), the image directory used to be left with the O_EXCL-created stub
+// files. A subsequent restore then consumed a truncated state file and failed
+// with "failed to load kernel: header error: EOF" instead of a clear
+// missing-image error. The contract now is: a failed checkpoint leaves NO
+// image behind. This test kills the sandbox out from under the checkpoint and
+// asserts the cleanup; it fails on trees without it.
+func TestCheckpointCleansImageWhenSandboxDies(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-dead")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+			// Keep the image dir separate from the output file's dir so the
+			// assertions below only see checkpoint artifacts.
+			imageDir := filepath.Join(dir, "image")
+			if err := os.MkdirAll(imageDir, 0755); err != nil {
+				t.Fatalf("os.MkdirAll failed: %v", err)
+			}
+
+			script := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 1; i=$((i+1)); done", outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+
+			// Kill the sandbox process the way an unexpected sentry death
+			// would: the checkpoint RPC below must fail, and the failure must
+			// not leave the image files it created behind.
+			sandboxPid := cont.SandboxPid()
+			if err := syscall.Kill(sandboxPid, syscall.SIGKILL); err != nil {
+				t.Fatalf("syscall.Kill(%d, SIGKILL) failed: %v", sandboxPid, err)
+			}
+			// Wait for the process to die so the RPC below fails on a closed
+			// control socket rather than racing the signal. A killed sentry
+			// may linger as a zombie (its parent has not reaped it), which
+			// still counts as dead: its descriptors are gone.
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if procDead(sandboxPid) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("sandbox process %d did not die after SIGKILL", sandboxPid)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			err = cont.Checkpoint(conf, imageDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone})
+			if err == nil {
+				t.Fatalf("checkpoint unexpectedly succeeded on a dead sandbox")
+			}
+			for _, name := range []string{"checkpoint.img", "pages_meta.img", "pages.img"} {
+				if _, statErr := os.Stat(filepath.Join(imageDir, name)); !os.IsNotExist(statErr) {
+					t.Errorf("image file %q left behind by failed checkpoint (checkpoint error: %v)", name, err)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckpointRestoreBackToBack is the contract test for the
+// checkpoint-image-truncation ticket: checkpoint, delete, restore cycles run
+// back-to-back must always yield a restorable image. The historical bug left
+// truncated images behind roughly one run in three under load; with the
+// failure-cleanup fix a failed checkpoint now removes its image, so a restore
+// can never observe a truncated state file.
+// TestCheckpointRestorePassFDDonation verifies the restored stdio / pass-FD
+// re-donation contract (wave-04): host resources that back guest descriptors
+// are keyed at save time by (container name, descriptor number) and are
+// re-bound at restore to NEWLY donated host files. oca's suspend tier depends
+// on this to swap a saved init's stdio for a fresh full-duplex endpoint.
+//
+// The container's guest fd 3 is a host pipe read-end via Args.PassFiles. The
+// container is checkpointed while blocked reading fd 3; the restore donates a
+// completely different pipe under the same guest descriptor and container
+// name, and the restored task must consume data written to the NEW pipe.
+func TestCheckpointRestorePassFDDonation(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "passfd-donate")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+
+			// The container name annotation is the re-donation key's name
+			// component: both the checkpointed and the restored container must
+			// carry the same one.
+			const containerName = "w04-passfd-donation"
+			spec := testutil.NewSpecWithArgs("bash", "-c", fmt.Sprintf("cat <&3 > %q", outputPath))
+			spec.Annotations = map[string]string{
+				"io.kubernetes.cri.container-name": containerName,
+			}
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			// Guest fd 3 reads the FIRST pipe; keep it open and empty so the
+			// task blocks in read and survives until the checkpoint.
+			pipeARead, pipeAWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe: %v", err)
+			}
+			defer pipeAWrite.Close()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				PassFiles: map[int]*os.File{3: pipeARead},
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			// Give the task time to reach the blocking read on fd 3 before
+			// the checkpoint freezes it.
+			time.Sleep(2 * time.Second)
+
+			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			if err := cont.Destroy(); err != nil {
+				t.Fatalf("error destroying container: %v", err)
+			}
+			// Closing the original pipe's write end must not matter anymore;
+			// the restored task must not read from it either way.
+			pipeAWrite.Close()
+
+			// Restore under a fresh container ID but the same container-name
+			// annotation, donating a DIFFERENT pipe as guest fd 3.
+			pipeBRead, pipeBWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe: %v", err)
+			}
+			defer pipeBRead.Close()
+
+			args2 := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				PassFiles: map[int]*os.File{3: pipeBRead},
+			}
+			cont2, err := New(conf, args2)
+			if err != nil {
+				t.Fatalf("error creating restored container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+
+			const donated = "donated-after-restore\n"
+			if _, err := pipeBWrite.Write([]byte(donated)); err != nil {
+				t.Fatalf("writing to donated pipe: %v", err)
+			}
+			pipeBWrite.Close()
+
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("restored task never wrote output: %v", err)
+			}
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("os.ReadFile: %v", err)
+			}
+			if string(got) != donated {
+				t.Errorf("restored task output = %q, want %q (fd 3 must read the pipe donated at restore)", string(got), donated)
+			}
+		})
+	}
+}
+
+func TestCheckpointRestoreBackToBack(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-b2b")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			outputPath := filepath.Join(dir, "output")
+			specScript := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 1; i=$((i+1)); done", outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", specScript)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			const cycles = 3
+			var prevDir string
+			for cycle := 0; cycle < cycles; cycle++ {
+				cycleDir := filepath.Join(dir, fmt.Sprintf("cycle-%d", cycle))
+				if err := os.MkdirAll(cycleDir, 0755); err != nil {
+					t.Fatalf("os.MkdirAll failed: %v", err)
+				}
+				if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+					t.Fatalf("cycle %d: error removing output file: %v", cycle, err)
+				}
+				outputFile, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+
+				id := testutil.RandomContainerID()
+				args := Args{ID: id, Spec: spec, BundleDir: bundleDir}
+				cont, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("cycle %d: error creating container: %v", cycle, err)
+				}
+				if cycle == 0 {
+					if err := cont.Start(conf); err != nil {
+						t.Fatalf("cycle %d: error starting container: %v", cycle, err)
+					}
+					if err := waitForFileNotEmpty(outputFile); err != nil {
+						t.Fatalf("cycle %d: failed to wait for output file: %v", cycle, err)
+					}
+				} else {
+					if err := cont.Restore(conf, prevDir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+						t.Fatalf("cycle %d: error restoring container: %v", cycle, err)
+					}
+					if err := waitForFileNotEmpty(outputFile); err != nil {
+						t.Fatalf("cycle %d: failed to wait for restored output file: %v", cycle, err)
+					}
+				}
+
+				// Back-to-back: checkpoint then immediately delete and let
+				// the next cycle restore from the fresh image.
+				if err := cont.Checkpoint(conf, cycleDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+					t.Fatalf("cycle %d: error checkpointing container: %v", cycle, err)
+				}
+				if err := cont.Destroy(); err != nil {
+					t.Fatalf("cycle %d: error destroying container: %v", cycle, err)
+				}
+				outputFile.Close()
+				prevDir = cycleDir
+			}
+		})
+	}
+}
+
 func TestCheckpointRestoreSignalHandlerRead(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Checkpoint not supported")
@@ -1982,6 +2295,136 @@ func TestCheckpointRestoreHostname(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPortForwardDialProbe exercises the minimum host-to-sandbox dial
+// surface used for health probes without exec-in-sandbox (wave-04):
+// Container.PortForward donates one file descriptor and the sandbox splices
+// it to the (container, port) target. With host networking the target is
+// 127.0.0.1:port, so the test itself can be the listener and prove the dial
+// carries data in both directions.
+func TestPortForwardDialProbe(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		conf.Network = config.NetworkHost
+		t.Run(name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("net.Listen: %v", err)
+			}
+			defer ln.Close()
+			port := ln.Addr().(*net.TCPAddr).Port
+
+			spec := testutil.NewSpecWithArgs("sleep", "1000")
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			// The probe endpoint: one end of a socketpair is donated to the
+			// sandbox; the test keeps the other.
+			probeClient, probeServer, err := socketpair()
+			if err != nil {
+				t.Fatalf("socketpair: %v", err)
+			}
+			defer probeClient.Close()
+
+			done := make(chan error, 1)
+			go func() {
+				done <- cont.PortForward(&boot.PortForwardOpts{
+					Port: uint16(port),
+					FilePayload: urpc.FilePayload{
+						Files: []*os.File{probeServer},
+					},
+				})
+			}()
+
+			// The dial must reach the listener; data written on the probe end
+			// must arrive there, and a reply must come back.
+			type result struct {
+				conn net.Conn
+				err  error
+			}
+			accepted := make(chan result, 1)
+			go func() {
+				conn, err := ln.Accept()
+				accepted <- result{conn, err}
+			}()
+
+			const probeMsg = "probe-dial"
+			if _, err := probeClient.Write([]byte(probeMsg)); err != nil {
+				t.Fatalf("writing probe message: %v", err)
+			}
+			var conn net.Conn
+			select {
+			case r := <-accepted:
+				if r.err != nil {
+					t.Fatalf("Accept: %v", r.err)
+				}
+				conn = r.conn
+			case <-time.After(pollTimeout):
+				t.Fatalf("port-forward dial never reached the listener")
+			}
+			defer conn.Close()
+
+			buf := make([]byte, len(probeMsg))
+			_ = conn.SetReadDeadline(time.Now().Add(pollTimeout))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				t.Fatalf("reading probe message at the listener: %v", err)
+			}
+			if string(buf) != probeMsg {
+				t.Errorf("listener got %q, want %q", string(buf), probeMsg)
+			}
+			const replyMsg = "probe-ack"
+			if _, err := conn.Write([]byte(replyMsg)); err != nil {
+				t.Fatalf("writing reply: %v", err)
+			}
+			reply := make([]byte, len(replyMsg))
+			_ = probeClient.SetReadDeadline(time.Now().Add(pollTimeout))
+			if _, err := io.ReadFull(probeClient, reply); err != nil {
+				t.Fatalf("reading reply on the probe end: %v", err)
+			}
+			if string(reply) != replyMsg {
+				t.Errorf("probe got %q, want %q", string(reply), replyMsg)
+			}
+			// PortForward blocks for the lifetime of the forwarded
+			// connection; closing both ends lets it return.
+			conn.Close()
+			probeClient.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("PortForward returned error: %v", err)
+				}
+			case <-time.After(pollTimeout):
+				t.Errorf("PortForward did not return after the connection closed")
+			}
+		})
+	}
+}
+
+// socketpair returns the two ends of a connected AF_UNIX SOCK_STREAM pair.
+func socketpair() (*os.File, *os.File, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	a := os.NewFile(uintptr(fds[0]), "probe-a")
+	b := os.NewFile(uintptr(fds[1]), "probe-b")
+	return a, b, nil
 }
 
 // TestCheckpointRestoreHostinet does the checkpoint/restore test with host
