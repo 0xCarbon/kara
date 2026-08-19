@@ -204,6 +204,13 @@ type Args struct {
 
 	// SplitFSRestore indicates that we are restoring from a split filesystem checkpoint.
 	SplitFSRestore bool
+
+	// IOFDs, when non-empty, are sandbox-side gofer-connection FDs (lisafs)
+	// donated by the caller for an external gofer. runsc will not spawn its
+	// own gofer process; these FDs map 1:1, in order, to the gofer-backed
+	// mounts (root first, then spec mounts). Only valid for the root
+	// container of a new sandbox.
+	IOFDs []int
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -389,7 +396,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 		return err
 	}
 	if err := cgroup.RunInCgroup(containerCgroup, func(cloneIntoCgroupFD *os.File) error {
-		ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD)
+		ioFiles, goferFilestores, devIOFile, specFile, err := c.createGoferProcess(conf, mountHints, args.Attached, cloneIntoCgroupFD, args.IOFDs)
 		if err != nil {
 			return fmt.Errorf("cannot create gofer process: %w", err)
 		}
@@ -499,7 +506,7 @@ func (c *Container) startImpl(conf *config.Config, action string, startRoot func
 		// the start (and all their children processes).
 		if err := cgroup.RunInCgroup(c.Sandbox.CgroupJSON.Cgroup, func(cloneIntoCgroupFD *os.File) error {
 			// Create the gofer process.
-			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, c.Sandbox.MountHints, false /* attached */, cloneIntoCgroupFD)
+			goferFiles, goferFilestores, devIOFile, mountsFile, err := c.createGoferProcess(conf, c.Sandbox.MountHints, false /* attached */, cloneIntoCgroupFD, nil)
 			if err != nil {
 				return err
 			}
@@ -1383,7 +1390,7 @@ func createLisafsSocketPair(sandEnds *[]*os.File, donations *donation.Agency) er
 // a gofer endpoint for the mount points using Gofers. The mounts file is the
 // file to read list of mounts after they have been resolved (direct paths,
 // no symlinks), and will be nil if there is no cleaning required for mounts.
-func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.PodMountHints, attached bool, cloneIntoCgroupFD *os.File) ([]*os.File, []*os.File, *os.File, *os.File, error) {
+func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.PodMountHints, attached bool, cloneIntoCgroupFD *os.File, ioFDs []int) ([]*os.File, []*os.File, *os.File, *os.File, error) {
 	rootfsHint, err := boot.NewRootfsHint(c.Spec)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("error creating rootfs hint: %w", err)
@@ -1396,6 +1403,58 @@ func (c *Container) createGoferProcess(conf *config.Config, mountHints *boot.Pod
 		// rootfs with NVIDIA libraries and devices. With EROFS, spec.Root.Path
 		// points to an empty directory and populating that has no effect.
 		return nil, nil, nil, nil, fmt.Errorf("nvidia-container-runtime-hook cannot be used together with non-lisafs backed root mount")
+	}
+	// External gofer mode: the caller runs its own lisafs gofer(s) and donates
+	// the sandbox-side connection FD(s) via `runsc create --io-fds`. Skip
+	// spawning runsc's own gofer and wire the donated FDs straight through as
+	// the sandbox IO files. The FDs map 1:1, in order, to the lisafs/erofs
+	// gofer mounts (root first, then spec mounts) -- the same ordering runsc's
+	// own gofer uses. This lets an embedder (e.g. Oca managed mode) serve the
+	// sandbox filesystem from its own gofer process.
+	if len(ioFDs) > 0 {
+		if shouldCreateDeviceGofer(c.Spec, conf) {
+			return nil, nil, nil, nil, fmt.Errorf("external gofer (--io-fds) is not supported alongside a device gofer (GPU/TPU)")
+		}
+		// A self/anon overlay needs gofer-created filestore files, made in the
+		// gofer's mount namespace by createGoferFilestores -- which only runs
+		// when runsc spawns its own gofer. With an external gofer there is no
+		// such process, so the filestore FDs would be absent and the sandbox
+		// boot process would panic ("fdDispenser out of fds"). Reject up front.
+		for _, cfg := range c.GoferMountConfs {
+			if cfg.IsFilestorePresent() {
+				return nil, nil, nil, nil, fmt.Errorf("external gofer (--io-fds) is incompatible with self/anon overlay2 (no local gofer to create filestore files)")
+			}
+		}
+		// CreateContainer hooks are executed by runsc's gofer during
+		// SetupRootFS; no gofer is spawned in this mode, so they would be
+		// silently skipped. Fail loudly instead: the embedder owns them.
+		if c.Spec.Hooks != nil && len(c.Spec.Hooks.CreateContainer) > 0 {
+			return nil, nil, nil, nil, fmt.Errorf("external gofer (--io-fds) does not execute CreateContainer hooks; execute them in the external gofer/harness or remove them from the spec")
+		}
+		wantFDs := 0
+		for _, cfg := range c.GoferMountConfs {
+			if cfg.ShouldUseLisafs() || cfg.ShouldUseErofs() {
+				wantFDs++
+			}
+		}
+		if len(ioFDs) != wantFDs {
+			return nil, nil, nil, nil, fmt.Errorf("external gofer: got %d --io-fds but the spec needs %d gofer IO FD(s)", len(ioFDs), wantFDs)
+		}
+		sandEnds := make([]*os.File, 0, len(ioFDs))
+		for i, fd := range ioFDs {
+			if fd < 0 {
+				return nil, nil, nil, nil, fmt.Errorf("external gofer: invalid --io-fds entry %d: fd %d", i, fd)
+			}
+			sandEnds = append(sandEnds, os.NewFile(uintptr(fd), fmt.Sprintf("external gofer IO FD %d", i)))
+		}
+		// No gofer process is spawned, so cloneIntoCgroupFD is not consumed
+		// here: there is no gofer to spawn into the container cgroup. The FD
+		// remains with the caller (RunInCgroup) and is still used to spawn the
+		// sandbox process itself, so it must be neither rejected nor closed.
+		// c.GoferPid stays unset and goferIsChild remains false, so teardown
+		// won't try to reap a child we didn't start. MountsFile is nil; boot
+		// treats mounts-fd as optional (default -1).
+		return sandEnds, nil, nil, nil, nil
 	}
 	if !shouldSpawnGofer(c.Spec, conf, c.GoferMountConfs) {
 		if !c.GoferMountConfs[0].ShouldUseErofs() {

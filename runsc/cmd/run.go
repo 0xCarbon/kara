@@ -168,6 +168,7 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 		ExecFile:           execFile,
 		FSRestoreImagePath: r.fsRestoreImagePath,
 		FSRestoreDirect:    r.fsRestoreDirect,
+		IOFDs:              r.ioFDs,
 	}
 	ws, err := container.Run(conf, runArgs)
 	if err != nil {
