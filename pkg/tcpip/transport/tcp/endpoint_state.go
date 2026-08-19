@@ -137,6 +137,20 @@ func (e *Endpoint) afterLoad(ctx context.Context) {
 	// Restore the endpoint to InitialState as it will be moved to
 	// its origEndpointState during Restore.
 	e.state = atomicbitops.FromUint32(uint32(StateInitial))
+	// A stream whose initial bytes were still held for classification cannot
+	// safely resume: the gate session does not survive a checkpoint, so the
+	// held prefix can never be classified. Restore it as a terminated
+	// connection unconditionally — including under AllowLiveTCPMigration
+	// (which defaults to true and would otherwise skip terminateAtRestore
+	// and resume the flow with unclassified bytes still queued).
+	if e.egressL7Hold {
+		e.terminateAtRestore = true
+		e.egressL7Terminate = true
+		e.egressL7Required = false
+		e.egressL7Hold = false
+		e.egressL7Prefix = nil
+		e.egressL7Rounds = 0
+	}
 	e.stack.RegisterRestoredEndpoint(e)
 }
 
@@ -203,7 +217,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		e.setEndpointState(StateBound)
 	}
 
-	if terminateAtRestore && !e.stack.AllowLiveTCPMigration() {
+	if terminateAtRestore && !e.stack.AllowLiveTCPMigration() || e.egressL7Terminate {
 		e.closeEndpointAtRestore()
 		return
 	}

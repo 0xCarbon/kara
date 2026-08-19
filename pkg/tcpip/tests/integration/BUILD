@@ -6,6 +6,23 @@ package(
 )
 
 go_test(
+    name = "egress_gate_test",
+    size = "small",
+    srcs = ["egress_gate_test.go"],
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/adapters/gonet",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/network/ipv4",
+        "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/udp",
+        "//pkg/waiter",
+    ],
+)
+
+go_test(
     name = "forward_test",
     size = "small",
     srcs = ["forward_test.go"],

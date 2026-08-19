@@ -163,6 +163,8 @@ func (r *Restore) Execute(_ context.Context, f *flag.FlagSet, args ...any) subco
 		FSRestoreDirect:    r.fsRestoreDirect,
 		CheckpointDirPath:  r.imagePath,
 		SplitFSRestore:     r.splitFSRestore,
+		IOFDs:              r.ioFDs,
+		EgressFD:           optionalFD(r.egressFD),
 	}
 
 	log.Debugf("Restore container, cid: %s, rootDir: %q", id, conf.RootDir)

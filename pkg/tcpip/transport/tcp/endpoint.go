@@ -375,6 +375,21 @@ type Endpoint struct {
 	// endpoint is in this state. hardError is protected by endpoint mu.
 	hardError tcpip.Error
 
+	// egressL7Required is set only for outbound connections admitted by the
+	// stack egress gate. While egressL7Hold is set, no queued stream byte may
+	// be emitted. The accumulated prefix and number of host decisions are
+	// bounded independently of the socket send buffer.
+	egressL7Required bool
+	egressL7Hold     bool
+	egressL7Prefix   []byte
+	egressL7Rounds   uint16
+
+	// egressL7Terminate marks a restored endpoint whose stream was captured
+	// mid-L7-hold: the gate session cannot be replayed across a checkpoint,
+	// so the flow must terminate at restore regardless of live-migration
+	// mode (fail closed; no buffered prefix may escape unclassified).
+	egressL7Terminate bool `state:"nosave"`
+
 	// lastError represents the last error that the endpoint reported;
 	// access to it is protected by the following mutex.
 	lastErrorMu lastErrorMutex `state:"nosave"`
@@ -1670,9 +1685,92 @@ func (e *Endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	if n == 0 || err != nil {
 		return 0, err
 	}
+	if e.egressL7Required {
+		e.appendEgressL7Prefix(nextSeg)
+		if err := e.classifyEgressL7(false /* final */); err != nil {
+			return 0, err
+		}
+		if e.egressL7Hold {
+			return int64(n), nil
+		}
+	}
 
 	e.sendData(nextSeg)
 	return int64(n), nil
+}
+
+const (
+	egressL7SniffLimit = 32 * 1024
+	egressL7MaxRounds  = 128
+)
+
+// appendEgressL7Prefix mirrors at most the first egressL7SniffLimit stream
+// bytes. The segment remains owned by the regular TCP write queue.
+// +checklocks:e.mu
+func (e *Endpoint) appendEgressL7Prefix(seg *segment) {
+	remaining := egressL7SniffLimit - len(e.egressL7Prefix)
+	if remaining <= 0 {
+		return
+	}
+	payloadBuffer := seg.pkt.Data().ToBuffer()
+	defer payloadBuffer.Release()
+	payload := payloadBuffer.Flatten()
+	if len(payload) > remaining {
+		payload = payload[:remaining]
+	}
+	e.egressL7Prefix = append(e.egressL7Prefix, payload...)
+}
+
+// classifyEgressL7 asks the host to classify the complete accumulated prefix.
+// A need-more verdict installs an explicit send hold. An allow verdict releases
+// from the front of the write list. At stream EOF, need-more is a denial.
+// +checklocks:e.mu
+func (e *Endpoint) classifyEgressL7(final bool) tcpip.Error {
+	if !e.egressL7Required {
+		return nil
+	}
+	if e.egressL7Rounds >= egressL7MaxRounds {
+		return e.denyEgressL7(&tcpip.ErrConnectionRefused{})
+	}
+	g := e.stack.EgressGate()
+	if g == nil {
+		return e.denyEgressL7(&tcpip.ErrConnectionRefused{})
+	}
+	e.egressL7Rounds++
+	id := e.TransportEndpointInfo.ID
+	needMore, err := g.CheckL7(tcpip.FullAddress{
+		NIC:  e.boundNICID,
+		Addr: id.RemoteAddress,
+		Port: id.RemotePort,
+	}, e.egressL7Prefix)
+	if err != nil {
+		return e.denyEgressL7(err)
+	}
+	if needMore {
+		if final || len(e.egressL7Prefix) == egressL7SniffLimit {
+			return e.denyEgressL7(&tcpip.ErrConnectionRefused{})
+		}
+		e.egressL7Hold = true
+		return nil
+	}
+
+	e.egressL7Required = false
+	e.egressL7Hold = false
+	e.egressL7Prefix = nil
+	e.egressL7Rounds = 0
+	e.snd.updateWriteNext(e.snd.writeList.Front())
+	return nil
+}
+
+// denyEgressL7 purges all buffered bytes before resetting the connection.
+// +checklocks:e.mu
+func (e *Endpoint) denyEgressL7(err tcpip.Error) tcpip.Error {
+	e.egressL7Required = false
+	e.egressL7Hold = false
+	e.egressL7Prefix = nil
+	e.egressL7Rounds = 0
+	e.resetConnectionLocked(err)
+	return err
 }
 
 // selectWindowLocked returns the new window without checking for shrinking or scaling
@@ -2451,6 +2549,19 @@ func (e *Endpoint) connect(addr tcpip.FullAddress, handshake bool) tcpip.Error {
 		return &tcpip.ErrInvalidEndpointState{}
 	}
 
+	// Oca egress gate (#447): reject a denied outbound connect before
+	// FindRoute so the guest gets a clean error and no SYN is sent. This
+	// runs after endpoint-state validation so already-connected and
+	// already-connecting sockets keep Linux's EISCONN/EALREADY precedence
+	// over a denied or dead gate.
+	requireEgressL7 := false
+	if g := e.stack.EgressGate(); g != nil {
+		if gerr := g.CheckTCP(addr); gerr != nil {
+			return gerr
+		}
+		requireEgressL7 = handshake
+	}
+
 	// Find a route to the desired destination.
 	r, err := e.stack.FindRoute(nicID, e.TransportEndpointInfo.ID.LocalAddress, addr.Addr, netProto, false /* multicastLoop */)
 	if err != nil {
@@ -2513,6 +2624,7 @@ func (e *Endpoint) connect(addr tcpip.FullAddress, handshake bool) tcpip.Error {
 	}
 
 	// Start a new handshake.
+	e.egressL7Required = requireEgressL7
 	h := e.newHandshake()
 	e.setEndpointState(StateSynSent)
 	h.start()
@@ -2550,6 +2662,11 @@ func (e *Endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 	e.shutdownFlags |= flags
 	switch {
 	case e.EndpointState().connected():
+		if e.shutdownFlags&tcpip.ShutdownWrite != 0 && e.egressL7Required {
+			if err := e.classifyEgressL7(true /* final */); err != nil {
+				return err
+			}
+		}
 		// Close for read.
 		if e.shutdownFlags&tcpip.ShutdownRead != 0 {
 			// Mark read side as closed.
