@@ -7,7 +7,11 @@ package(
 
 go_library(
     name = "fd",
-    srcs = ["fd.go"],
+    srcs = [
+        "fd.go",
+        "open_linux.go",
+        "open_stub.go",
+    ],
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
