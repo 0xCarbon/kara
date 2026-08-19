@@ -1706,10 +1706,58 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
-		return fmt.Errorf("checkpointing container %q: %w", cid, err)
+		err = fmt.Errorf("checkpointing container %q: %w", cid, err)
+		if !opt.UseCheckpointGofer {
+			// The checkpoint RPC failed, so the sandbox died before (or
+			// while) finalizing the image: anything it managed to write is
+			// a partial image. The files were O_EXCL-created by this call
+			// (setCheckpointOptsFiles above succeeded), so removing exactly
+			// them can never delete a pre-existing image. Leaving them
+			// behind would let a later `runsc restore` consume a truncated
+			// image and fail with a cryptic state-decode error (e.g.
+			// "header error: EOF") instead of a missing image.
+			if rmErr := removeLocalSaveFiles(imagePath, opts); rmErr != nil {
+				log.Warningf("Checkpoint failed (%v) and cleaning up the incomplete image files at %q failed too: %v", err, imagePath, rmErr)
+			} else {
+				log.Warningf("Checkpoint failed (%v); removed the incomplete image files it created at %q", err, imagePath)
+			}
+		}
+		return err
 	}
 	s.Checkpointed = true
 	return nil
+}
+
+// removeLocalSaveFiles removes the checkpoint image files that
+// createSaveFiles() (and the split-filesystem variant) created in imagePath.
+//
+// Precondition: the corresponding setCheckpointOptsFilesForLocalCheckpoint()
+// call succeeded, which used O_EXCL to create these files; therefore they were
+// created by (and only by) that call, and removing them cannot destroy
+// pre-existing data. opts must be the same CheckpointOpts that were used.
+func removeLocalSaveFiles(imagePath string, opts CheckpointOpts) error {
+	names := []string{checkpointfiles.StateFileName}
+	if opts.Compression == statefile.CompressionLevelNone {
+		names = append(names, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName)
+	}
+	var errs []error
+	for _, name := range names {
+		if err := os.Remove(filepath.Join(imagePath, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	if len(opts.SplitFSCheckpointPaths) > 0 {
+		fsImagePath := filepath.Join(imagePath, "fs")
+		for _, name := range []string{checkpointfiles.FSCheckpointManifestFileName, checkpointfiles.FSCheckpointMultiTarFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
+			if err := os.Remove(filepath.Join(fsImagePath, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, err)
+			}
+		}
+		// Best-effort removal of the fs directory itself; it may fail if the
+		// checkpoint gofer wrote extra bookkeeping there.
+		_ = os.Remove(fsImagePath)
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Sandbox) setCheckpointOptsFiles(conf *config.Config, imagePath string, opts CheckpointOpts, opt *control.SaveOpts) error {
@@ -1745,6 +1793,13 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 			for _, f := range files {
 				_ = f.Close()
 			}
+			// openFSCheckpointLocalFiles removes its own partial creations;
+			// remove the checkpoint files this call created as well, so no
+			// half-created image survives a failed checkpoint.
+			if rmErr := removeLocalSaveFiles(imagePath, opts); rmErr != nil {
+				log.Warningf("Failed to create fs checkpoint files (%v) and cleaning up the partially created checkpoint files at %q failed too: %v", err, imagePath, rmErr)
+			}
+			_ = os.Remove(fsImagePath)
 			return fmt.Errorf("creating fs checkpoint files: %w", err)
 		}
 		opt.FilePayload.Files = append(opt.FilePayload.Files, fsFiles...)
@@ -1757,12 +1812,28 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 // RPCs and argument passing to the sandbox.
 func createSaveFiles(path string, direct bool, compression statefile.CompressionLevel) ([]*os.File, error) {
 	var files []*os.File
+	// createdPaths tracks the files this call created so far. On failure, they
+	// are removed: a caller that retries with the same image-path must not
+	// find O_EXCL leftovers from a partially failed attempt, and nothing else
+	// must ever observe a half-created image.
+	var createdPaths []string
+	defer func() {
+		if createdPaths != nil {
+			for _, f := range files {
+				_ = f.Close()
+			}
+			for _, p := range createdPaths {
+				_ = os.Remove(p)
+			}
+		}
+	}()
 
 	stateFilePath := filepath.Join(path, checkpointfiles.StateFileName)
 	f, err := os.OpenFile(stateFilePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("creating checkpoint state file %q: %w", stateFilePath, err)
 	}
+	createdPaths = append(createdPaths, stateFilePath)
 	files = append(files, f)
 
 	// When there is no compression, MemoryFile contents are page-aligned.
@@ -1774,6 +1845,7 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 		if err != nil {
 			return nil, fmt.Errorf("creating checkpoint pages metadata file %q: %w", pagesMetadataFilePath, err)
 		}
+		createdPaths = append(createdPaths, pagesMetadataFilePath)
 		files = append(files, f)
 
 		pagesFilePath := filepath.Join(path, checkpointfiles.PagesFileName)
@@ -1786,9 +1858,13 @@ func createSaveFiles(path string, direct bool, compression statefile.Compression
 		if err != nil {
 			return nil, fmt.Errorf("creating checkpoint pages file %q: %w", pagesFilePath, err)
 		}
+		createdPaths = append(createdPaths, pagesFilePath)
 		files = append(files, f)
 	}
 
+	// Success: transfer ownership of the created files to the caller; the
+	// deferred cleanup must not remove them on return.
+	createdPaths = nil
 	return files, nil
 }
 
@@ -1872,11 +1948,17 @@ func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string,
 
 func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([]*os.File, error) {
 	var files [4]*os.File
+	var createdPaths []string
 	closeCleanup := cleanup.Make(func() {
 		for _, f := range files {
 			if f != nil {
 				f.Close()
 			}
+		}
+		// Remove partial creations so a retried checkpoint does not hit
+		// O_EXCL leftovers and no half-created image is ever observable.
+		for _, p := range createdPaths {
+			_ = os.Remove(p)
 		}
 	})
 	defer closeCleanup.Clean()
@@ -1912,6 +1994,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening manifest file %q: %w", manifestFilePath, err)
 	}
 	files[0] = manifestFile
+	createdPaths = append(createdPaths, manifestFilePath)
 
 	multiTarFilePath := filepath.Join(imagePath, checkpointfiles.FSCheckpointMultiTarFileName)
 	multiTarFile, err := os.OpenFile(multiTarFilePath, openFlags, 0644)
@@ -1919,6 +2002,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening multi-tar file %q: %w", multiTarFilePath, err)
 	}
 	files[1] = multiTarFile
+	createdPaths = append(createdPaths, multiTarFilePath)
 
 	pagesMetadataFilePath := filepath.Join(imagePath, checkpointfiles.PagesMetadataFileName)
 	pagesMetadataFile, err := os.OpenFile(pagesMetadataFilePath, openFlags, 0644)
@@ -1926,6 +2010,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening pages metadata file %q: %w", pagesMetadataFilePath, err)
 	}
 	files[2] = pagesMetadataFile
+	createdPaths = append(createdPaths, pagesMetadataFilePath)
 
 	pagesFilePath := filepath.Join(imagePath, checkpointfiles.PagesFileName)
 	pagesFileFD, err := unix.Open(pagesFilePath, openFlags|maybeODirect, 0644)
@@ -1933,6 +2018,7 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		return nil, fmt.Errorf("opening pages metadata file %q: %w", pagesFilePath, err)
 	}
 	files[3] = os.NewFile(uintptr(pagesFileFD), pagesFilePath)
+	createdPaths = append(createdPaths, pagesFilePath)
 
 	closeCleanup.Release()
 	return files[:], nil

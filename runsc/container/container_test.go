@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1414,6 +1415,196 @@ func TestCheckpointRestore(t *testing.T) {
 // gofer-backed fd all complete, and the main loop keeps running. (The read
 // has data pre-seeded, so this verifies post-restore fd state and delivery,
 // not blocking semantics.)
+// procDead reports whether the given pid is gone or a zombie.
+func procDead(pid int) bool {
+	if err := syscall.Kill(pid, 0); err != nil {
+		return true
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return true
+	}
+	// The state is the field after the parenthesized comm; find the last ')'.
+	if i := bytes.LastIndexByte(data, ')'); i >= 0 && i+2 < len(data) {
+		return data[i+2] == 'Z'
+	}
+	return false
+}
+
+// TestCheckpointCleansImageWhenSandboxDies reproduces the failure mode behind
+// the checkpoint-image-truncation ticket (wave-04): when the sandbox dies
+// before the checkpoint RPC completes (observed in the wild as "urpc method
+// ... failed: EOF" from a sandbox that exited mid-save, e.g. after a sentry
+// panic), the image directory used to be left with the O_EXCL-created stub
+// files. A subsequent restore then consumed a truncated state file and failed
+// with "failed to load kernel: header error: EOF" instead of a clear
+// missing-image error. The contract now is: a failed checkpoint leaves NO
+// image behind. This test kills the sandbox out from under the checkpoint and
+// asserts the cleanup; it fails on trees without it.
+func TestCheckpointCleansImageWhenSandboxDies(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-dead")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+			// Keep the image dir separate from the output file's dir so the
+			// assertions below only see checkpoint artifacts.
+			imageDir := filepath.Join(dir, "image")
+			if err := os.MkdirAll(imageDir, 0755); err != nil {
+				t.Fatalf("os.MkdirAll failed: %v", err)
+			}
+
+			script := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 1; i=$((i+1)); done", outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("Failed to wait for output file: %v", err)
+			}
+
+			// Kill the sandbox process the way an unexpected sentry death
+			// would: the checkpoint RPC below must fail, and the failure must
+			// not leave the image files it created behind.
+			sandboxPid := cont.SandboxPid()
+			if err := syscall.Kill(sandboxPid, syscall.SIGKILL); err != nil {
+				t.Fatalf("syscall.Kill(%d, SIGKILL) failed: %v", sandboxPid, err)
+			}
+			// Wait for the process to die so the RPC below fails on a closed
+			// control socket rather than racing the signal. A killed sentry
+			// may linger as a zombie (its parent has not reaped it), which
+			// still counts as dead: its descriptors are gone.
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if procDead(sandboxPid) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("sandbox process %d did not die after SIGKILL", sandboxPid)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			err = cont.Checkpoint(conf, imageDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone})
+			if err == nil {
+				t.Fatalf("checkpoint unexpectedly succeeded on a dead sandbox")
+			}
+			for _, name := range []string{"checkpoint.img", "pages_meta.img", "pages.img"} {
+				if _, statErr := os.Stat(filepath.Join(imageDir, name)); !os.IsNotExist(statErr) {
+					t.Errorf("image file %q left behind by failed checkpoint (checkpoint error: %v)", name, err)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckpointRestoreBackToBack is the contract test for the
+// checkpoint-image-truncation ticket: checkpoint, delete, restore cycles run
+// back-to-back must always yield a restorable image. The historical bug left
+// truncated images behind roughly one run in three under load; with the
+// failure-cleanup fix a failed checkpoint now removes its image, so a restore
+// can never observe a truncated state file.
+func TestCheckpointRestoreBackToBack(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-b2b")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			outputPath := filepath.Join(dir, "output")
+			specScript := fmt.Sprintf("i=0; while true; do echo $i >> %q; sleep 1; i=$((i+1)); done", outputPath)
+			spec := testutil.NewSpecWithArgs("bash", "-c", specScript)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			const cycles = 3
+			var prevDir string
+			for cycle := 0; cycle < cycles; cycle++ {
+				cycleDir := filepath.Join(dir, fmt.Sprintf("cycle-%d", cycle))
+				if err := os.MkdirAll(cycleDir, 0755); err != nil {
+					t.Fatalf("os.MkdirAll failed: %v", err)
+				}
+				if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+					t.Fatalf("cycle %d: error removing output file: %v", cycle, err)
+				}
+				outputFile, err := createWriteableOutputFile(outputPath)
+				if err != nil {
+					t.Fatalf("error creating output file: %v", err)
+				}
+
+				id := testutil.RandomContainerID()
+				args := Args{ID: id, Spec: spec, BundleDir: bundleDir}
+				cont, err := New(conf, args)
+				if err != nil {
+					t.Fatalf("cycle %d: error creating container: %v", cycle, err)
+				}
+				if cycle == 0 {
+					if err := cont.Start(conf); err != nil {
+						t.Fatalf("cycle %d: error starting container: %v", cycle, err)
+					}
+					if err := waitForFileNotEmpty(outputFile); err != nil {
+						t.Fatalf("cycle %d: failed to wait for output file: %v", cycle, err)
+					}
+				} else {
+					if err := cont.Restore(conf, prevDir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+						t.Fatalf("cycle %d: error restoring container: %v", cycle, err)
+					}
+					if err := waitForFileNotEmpty(outputFile); err != nil {
+						t.Fatalf("cycle %d: failed to wait for restored output file: %v", cycle, err)
+					}
+				}
+
+				// Back-to-back: checkpoint then immediately delete and let
+				// the next cycle restore from the fresh image.
+				if err := cont.Checkpoint(conf, cycleDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+					t.Fatalf("cycle %d: error checkpointing container: %v", cycle, err)
+				}
+				if err := cont.Destroy(); err != nil {
+					t.Fatalf("cycle %d: error destroying container: %v", cycle, err)
+				}
+				outputFile.Close()
+				prevDir = cycleDir
+			}
+		})
+	}
+}
+
 func TestCheckpointRestoreSignalHandlerRead(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Checkpoint not supported")
