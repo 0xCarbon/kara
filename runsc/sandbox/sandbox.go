@@ -1706,7 +1706,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 
 	if err := s.call(boot.ContMgrCheckpoint, &opt, nil); err != nil {
-		err = fmt.Errorf("checkpointing container %q: %w", cid, err)
+		err = fmt.Errorf("checkpointing container %q: %w", cid, classifyCheckpointError(err))
 		if !opt.UseCheckpointGofer {
 			// The checkpoint RPC failed, so the sandbox died before (or
 			// while) finalizing the image: anything it managed to write is
