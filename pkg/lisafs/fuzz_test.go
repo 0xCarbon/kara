@@ -220,8 +220,8 @@ func serverDispatchBody(t testing.TB, b []byte) {
 	}
 
 	clientSock.Close()
-	s.Destroy()
 	s.Wait()
+	s.Destroy()
 }
 
 // FuzzServerDispatch fuzzes the server's request dispatch with hostile

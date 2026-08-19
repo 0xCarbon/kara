@@ -29,8 +29,12 @@ import (
 // RunWireConformanceTest replays the committed golden request corpus
 // (pkg/lisafs/testdata/golden, produced by the real go_marshal encoders) as
 // raw control-socket frames against a live server built from tester, using
-// an independent hand-rolled codec (mirroring a third-party implementer like
-// Oca's gofer). The wire contract being checked is pkg/lisafs/ABI.md: exact
+// an independent hand-rolled request encoder (mirroring a third-party
+// implementer like Oca's gofer; response decoding covers the header and
+// length bounds only). The harness uses a stream socket pair, not the
+// SEQPACKET control socket of a real deployment, so datagram-boundary
+// behavior is out of scope here. The wire contract being checked is
+// pkg/lisafs/ABI.md: exact
 // 8-byte sockHeader framing, response MID echo or Error(0), bounded
 // payloads, and no panics or silence on any input.
 func RunWireConformanceTest(t *testing.T, tester Tester) {
@@ -48,8 +52,8 @@ func RunWireConformanceTest(t *testing.T, tester Tester) {
 	server.StartConnection(conn)
 	defer func() {
 		clientSocket.Close()
-		server.Destroy()
 		server.Wait()
+		server.Destroy()
 	}()
 
 	// Handshake first (ABI.md §Connection lifecycle): a Mount frame with an

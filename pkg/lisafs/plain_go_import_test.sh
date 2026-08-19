@@ -27,9 +27,9 @@
 #  4. building and vetting the consumer with GOPROXY=off and a filesystem
 #     replace directive, then vetting the three packages in-tree.
 #
-# The three golang.org/x module dependencies of that import closure
-# (x/sys, x/exp, x/time; the only non-stdlib requirements of
-# lisafs+flipcall+fdchannel) are resolved with additional replace directives
+# The golang.org/x module dependencies used by that import closure
+# (x/sys and x/time are required; x/exp is kept defensively for closure
+# drift) are resolved with additional replace directives
 # pointing at copies from the ambient module cache, so the test never touches
 # the network. If the cache is cold, run `go mod download` first (the CI job
 # in .github/workflows/go.yml does this), or point
@@ -165,6 +165,23 @@ echo "== consumer go vet =="
   done
 } >> "${module_dir}/go.mod"
 echo "== in-tree go vet of the published packages =="
-(cd "${module_dir}" && "${go_bin}" vet ./pkg/lisafs/ ./pkg/flipcall/ ./pkg/fdchannel/)
+# Use a separate GOCACHE for this step: sharing the consumer build's cache
+# suppresses vet diagnostics for already-cached packages (vet verdicts come
+# from cache entries that only record build success).
+# pkg/flipcall is excluded: it carries three pre-existing upstream
+# `possible misuse of unsafe.Pointer` warnings (flipcall_unsafe.go:44,48,65)
+# that would mask new findings; its unsafe-pointer patterns are pinned by
+# pkg/flipcall/flipcall_layout_test.go instead.
+in_tree_gocache="${work}/gocache-intree"
+mkdir -p "${in_tree_gocache}"
+(cd "${module_dir}" && GOCACHE="${in_tree_gocache}" "${go_bin}" vet ./pkg/lisafs/ ./pkg/fdchannel/)
+
+echo "== darwin cross-compile of the seam (non-Linux portability guard) =="
+# pkg/flipcall must compile for a non-Linux GOOS (the wave-05 backend
+# contract; see pkg/flipcall/SEAM.md). lisafs/fdchannel are Linux-only for
+# now (documented in SEAM.md) and are not cross-compiled here.
+darwin_cache="${work}/gocache-darwin"
+mkdir -p "${darwin_cache}"
+(cd "${module_dir}" && GOCACHE="${darwin_cache}" GOOS=darwin GOARCH=arm64 "${go_bin}" build ./pkg/flipcall/)
 
 echo "PASS: pkg/lisafs, pkg/flipcall, pkg/fdchannel importable under plain go build outside the repo"

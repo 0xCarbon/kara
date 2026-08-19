@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -618,6 +619,10 @@ func extractMIDTableForTest(t *testing.T, path string) string {
 	if len(entries) == 0 {
 		t.Fatal("no MID constants parsed from message.go")
 	}
+	// Match abi_gen's output order (sorted by MID value), so that a MID
+	// constant declared out of numeric order in message.go does not produce
+	// a false freshness failure after correct regeneration.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].val < entries[j].val })
 	var buf strings.Builder
 	buf.WriteString("| MID | Name    | Purpose |\n")
 	buf.WriteString("|----:|---------|---------|\n")

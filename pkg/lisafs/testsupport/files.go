@@ -37,10 +37,23 @@ func FindDir(rel string) (string, error) {
 			return ms[0], nil
 		}
 	}
-	if st, err := os.Stat(rel); err == nil && st.IsDir() {
-		return rel, nil
+	// Plain "go test": callers pass repo-root-relative paths
+	// (e.g. "pkg/lisafs/testdata/golden"), but the working directory is the
+	// package directory, so also try ascending from there.
+	for dir := "."; ; dir = filepath.Join(dir, "..") {
+		cand := filepath.Join(dir, rel)
+		if st, err := os.Stat(cand); err == nil && st.IsDir() {
+			abs, err := filepath.Abs(cand)
+			if err != nil {
+				return cand, nil
+			}
+			return abs, nil
+		}
+		if dir == "/" || len(dir) > 6*3 { // bail after ~6 levels
+			break
+		}
 	}
-	return "", fmt.Errorf("test data directory %q not found (bazel runfiles or package-relative)", rel)
+	return "", fmt.Errorf("test data directory %q not found (bazel runfiles, package-relative, or repo-root ascent)", rel)
 }
 
 // GoldenCorpus returns the paths of the committed ABI golden vectors.

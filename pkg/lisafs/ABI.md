@@ -112,7 +112,8 @@ payload and transfers control; the peer replies in the same window.
    The client mmaps the window (`MAP_SHARED`) and completes the flipcall
    connect handshake. **Channels are mandatory for boot: the sentry's gofer
    client requires at least one channel to start a mount**
-   (`pkg/sentry/fsimpl/gofer/gofer.go` `StartChannels`) — a server that
+   (`pkg/lisafs/client.go` `StartChannels`, invoked by the sentry's gofer client
+at `pkg/sentry/fsimpl/gofer/gofer.go`) — a server that
    refuses all Channel RPCs cannot back a sandbox filesystem.
 4. **Steady state.** Non-`Mount`/`Channel` RPCs run over channels
    (round-robin); the control socket remains for Channel creation and as a
@@ -177,8 +178,10 @@ e.g. `SetStatResp.FailureMask` reports per-field failures instead of failing).
 
 ## Message layouts
 
-Sizes/offsets in decimal bytes; every row is asserted by
-`abi_conformance_test.go`. `pad` rows are explicit padding fields (zeros on
+Sizes/offsets in decimal bytes. Layouts marked with a `pin` test vector in
+`abi_conformance_test.go` are machine-asserted (size plus the pinned offsets);
+rows without a pin are documented from the wire definition and guarded by the
+golden corpus round-trips. `pad` rows are explicit padding fields (zeros on
 the wire). Dynamic fields are marked `dyn`.
 
 ### Common types

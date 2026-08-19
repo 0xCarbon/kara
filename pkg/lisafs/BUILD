@@ -185,7 +185,6 @@ go_test(
     deps = [
         "//pkg/abi/linux",
         "//pkg/flipcall",
-        "//pkg/hostarch",
         "//pkg/marshal/primitive",
         "//pkg/unet",
         "@org_golang_x_sys//unix:go_default_library",

@@ -216,7 +216,7 @@ This surface is continuously verified out-of-tree by
 archive, materializes the module exactly like the `go` branch does, and builds
 and vets a consumer module that imports all three packages with `GOPROXY=off`
 (the `.github/workflows/go.yml` `plain-go-consumer` job runs it on every PR).
-The test needs a `go` toolchain on `PATH` and the `golang.org/x/sys`,
-`golang.org/x/exp` and `golang.org/x/time` modules in the local module cache
-(`go mod download`), which are the only non-stdlib dependencies of that import
-closure.
+The test needs a `go` toolchain on `PATH` and the `golang.org/x/sys` and
+`golang.org/x/time` modules in the local module cache (`go mod download`) —
+the non-stdlib dependencies of that import closure (`golang.org/x/exp` is
+fetched defensively in case the closure drifts).
