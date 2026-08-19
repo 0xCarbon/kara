@@ -17,13 +17,21 @@
 
 package hostmm
 
+import "golang.org/x/sys/unix"
+
 // membarrier(2) does not exist on non-Linux hosts: Probe reports no support
-// (HaveGlobalMemoryBarrier and HaveProcessMemoryBarrier stay false, and the
-// barrier methods are only callable under those preconditions). Platforms
-// that require a memory barrier to coordinate with host-scheduled threads
-// cannot be built on these hosts; VM-backed platforms (Hypervisor.framework,
-// WHP2) do not need it because application threads are vCPUs the platform
-// already serializes. See pkg/sentry/platform/platform-seam.md.
-func probe(bool) HostMemBarrier {
-	return HostMemBarrier{}
+// (so the barrier methods' preconditions never hold), and the syscall
+// helpers fail closed with ENOSYS as unreachable insurance. VM-backed
+// platforms (Hypervisor.framework, WHP2) do not need a host membarrier
+// because application threads are vCPUs the platform already serializes.
+// See pkg/sentry/platform/platform-seam.md.
+func membarrierSyscall(uintptr) unix.Errno {
+	return unix.ENOSYS
 }
+
+func membarrierRawSyscall(uintptr) (uintptr, unix.Errno) {
+	return 0, unix.ENOSYS
+}
+
+// unixENOSYS is the errno probe treats as "membarrier not implemented".
+const unixENOSYS = unix.ENOSYS

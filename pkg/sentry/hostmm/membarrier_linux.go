@@ -19,65 +19,21 @@ package hostmm
 
 import (
 	"golang.org/x/sys/unix"
-
-	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/log"
 )
 
-// GlobalMemoryBarrier blocks until "all running threads [in the host OS] have
-// passed through a state where all memory accesses to user-space addresses
-// match program order between entry to and return from [GlobalMemoryBarrier]",
-// as for membarrier(2).
-//
-// Preconditions: HaveGlobalMemoryBarrier() == true.
-func (h HostMemBarrier) GlobalMemoryBarrier() error {
-	if !h.global {
-		panic("hostmm: GlobalMemoryBarrier called, but host does not support it")
-	}
-	if _, _, e := unix.Syscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_GLOBAL, 0 /* flags */, 0 /* unused */); e != 0 {
-		return e
-	}
-	return nil
+// membarrierSyscall issues the blocking-safe form of membarrier(2) for
+// commands that may block (MEMBARRIER_CMD_GLOBAL).
+func membarrierSyscall(cmd uintptr) unix.Errno {
+	_, _, e := unix.Syscall(unix.SYS_MEMBARRIER, cmd, 0 /* flags */, 0 /* unused */)
+	return e
 }
 
-// ProcessMemoryBarrier is equivalent to GlobalMemoryBarrier, but only
-// synchronizes with threads sharing a virtual address space (from the host OS'
-// perspective) with the calling thread.
-//
-// Preconditions: HaveProcessMemoryBarrier() == true.
-func (h HostMemBarrier) ProcessMemoryBarrier() error {
-	if !h.privateExpedited {
-		panic("hostmm: ProcessMemoryBarrier called unexpectedly")
-	}
-	if _, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
-		return e
-	}
-	return nil
+// membarrierRawSyscall issues the non-blocking form of membarrier(2) for
+// commands that never block, returning the raw return value.
+func membarrierRawSyscall(cmd uintptr) (uintptr, unix.Errno) {
+	n, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, cmd, 0 /* flags */, 0 /* unused */)
+	return n, e
 }
 
-func probe(probePrivateExpedited bool) HostMemBarrier {
-	var mb HostMemBarrier
-	supported, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_QUERY, 0 /* flags */, 0 /* unused */)
-	if e != 0 {
-		if e != unix.ENOSYS {
-			log.Warningf("membarrier(MEMBARRIER_CMD_QUERY) failed: %s", e.Error())
-		}
-		return mb
-	}
-	if supported&linux.MEMBARRIER_CMD_GLOBAL != 0 {
-		mb.global = true
-	}
-	if !probePrivateExpedited {
-		return mb
-	}
-	// Registering a  process for private-expedited membarrier blocks on an RCU
-	// grace period (tens of ms), so only do it if needed.
-	if req := uintptr(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED | linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED); supported&req == req {
-		if _, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
-			log.Warningf("membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) failed: %s", e.Error())
-		} else {
-			mb.privateExpedited = true
-		}
-	}
-	return mb
-}
+// unixENOSYS is the errno probe treats as "membarrier not implemented".
+const unixENOSYS = unix.ENOSYS
