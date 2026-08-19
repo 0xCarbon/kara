@@ -440,6 +440,36 @@ func (r *restorer) restore(l *Loader) error {
 		mfmap:     make(map[checkpoint.ResourceID]*pgalloc.MemoryFile),
 		sharedMfs: make(map[string]bool),
 	}
+	// Restored stdio / pass-FD re-donation contract (wave-04).
+	//
+	// Host resources that back guest file descriptors (host.inode, e.g. the
+	// donated stdio streams and --pass-fd files) cannot be serialized: at save
+	// time they are written into the image as placeholder host filesystem
+	// resources keyed by checkpoint.ResourceID{ContainerName, "host:<fd>"}
+	// (see fsimpl/host.MakeResourceID). At restore time the caller donates NEW
+	// host file descriptors, and the saved placeholders are re-bound to them
+	// through the fdmap built below.
+	//
+	// The key is (container name, guest descriptor number):
+	//   - The container name is the OCI annotation
+	//     io.kubernetes.cri.container-name of the RESTORED container's spec
+	//     (specutils.ContainerName), NOT the runtime container ID. A restore
+	//     therefore re-donates correctly only when the spec carries the same
+	//     container-name annotation as the checkpointed container (containers
+	//     without the annotation fall back to positional names "__no_name_N",
+	//     which match only when containers are restored in the same order they
+	//     were created).
+	//   - For stdio, the descriptor number is the position of the donated FD
+	//     in the --stdio-fds list (stdin=0, stdout=1, stderr=2): the FDs are
+	//     donated positionally at sandbox boot and keyed by index.
+	//   - For pass-FDs (--pass-fd M:N, or library Args.PassFiles[N]), the
+	//     descriptor number is the GUEST fd N of the original mapping; the
+	//     restored mapping may use a different host FD M.
+	//
+	// Embedders (e.g. oca's RestoreWithInitControl) rely on this to replace a
+	// saved init's stdio with a fresh full-duplex AF_UNIX endpoint: donate the
+	// new endpoint as guest fd 0 under the same container name, and the
+	// restored kernel re-binds it during LoadFrom.
 	for _, cont := range r.containers {
 		// TODO(b/298078576): Need to process hints here probably
 		mntr := l.newContainerMounter(cont)

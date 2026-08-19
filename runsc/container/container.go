@@ -186,7 +186,14 @@ type Args struct {
 	Attached bool
 
 	// PassFiles are user-supplied files from the host to be exposed to the
-	// sandboxed app.
+	// sandboxed app, keyed by guest descriptor number.
+	//
+	// Across checkpoint/restore these host resources are re-donated, not
+	// serialized: a restored container re-binds its saved guest descriptors to
+	// whatever host files PassFiles provides under the same guest descriptor
+	// number (and the same container-name annotation). This is the library
+	// surface of the restored stdio / pass-FD re-donation contract documented
+	// in runsc/boot/restore.go.
 	PassFiles map[int]*os.File
 
 	// ExecFile is the host file used for program execution.

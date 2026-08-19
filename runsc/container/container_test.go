@@ -1532,6 +1532,127 @@ func TestCheckpointCleansImageWhenSandboxDies(t *testing.T) {
 // truncated images behind roughly one run in three under load; with the
 // failure-cleanup fix a failed checkpoint now removes its image, so a restore
 // can never observe a truncated state file.
+// TestCheckpointRestorePassFDDonation verifies the restored stdio / pass-FD
+// re-donation contract (wave-04): host resources that back guest descriptors
+// are keyed at save time by (container name, descriptor number) and are
+// re-bound at restore to NEWLY donated host files. oca's suspend tier depends
+// on this to swap a saved init's stdio for a fresh full-duplex endpoint.
+//
+// The container's guest fd 3 is a host pipe read-end via Args.PassFiles. The
+// container is checkpointed while blocked reading fd 3; the restore donates a
+// completely different pipe under the same guest descriptor and container
+// name, and the restored task must consume data written to the NEW pipe.
+func TestCheckpointRestorePassFDDonation(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint not supported")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "passfd-donate")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+
+			outputPath := filepath.Join(dir, "output")
+			outputFile, err := createWriteableOutputFile(outputPath)
+			if err != nil {
+				t.Fatalf("error creating output file: %v", err)
+			}
+			defer outputFile.Close()
+
+			// The container name annotation is the re-donation key's name
+			// component: both the checkpointed and the restored container must
+			// carry the same one.
+			const containerName = "w04-passfd-donation"
+			spec := testutil.NewSpecWithArgs("bash", "-c", fmt.Sprintf("cat <&3 > %q", outputPath))
+			spec.Annotations = map[string]string{
+				"io.kubernetes.cri.container-name": containerName,
+			}
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			// Guest fd 3 reads the FIRST pipe; keep it open and empty so the
+			// task blocks in read and survives until the checkpoint.
+			pipeARead, pipeAWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe: %v", err)
+			}
+			defer pipeAWrite.Close()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				PassFiles: map[int]*os.File{3: pipeARead},
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+			// Give the task time to reach the blocking read on fd 3 before
+			// the checkpoint freezes it.
+			time.Sleep(2 * time.Second)
+
+			if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+				t.Fatalf("error checkpointing container: %v", err)
+			}
+			if err := cont.Destroy(); err != nil {
+				t.Fatalf("error destroying container: %v", err)
+			}
+			// Closing the original pipe's write end must not matter anymore;
+			// the restored task must not read from it either way.
+			pipeAWrite.Close()
+
+			// Restore under a fresh container ID but the same container-name
+			// annotation, donating a DIFFERENT pipe as guest fd 3.
+			pipeBRead, pipeBWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe: %v", err)
+			}
+			defer pipeBRead.Close()
+
+			args2 := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+				PassFiles: map[int]*os.File{3: pipeBRead},
+			}
+			cont2, err := New(conf, args2)
+			if err != nil {
+				t.Fatalf("error creating restored container: %v", err)
+			}
+			defer cont2.Destroy()
+			if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+				t.Fatalf("error restoring container: %v", err)
+			}
+
+			const donated = "donated-after-restore\n"
+			if _, err := pipeBWrite.Write([]byte(donated)); err != nil {
+				t.Fatalf("writing to donated pipe: %v", err)
+			}
+			pipeBWrite.Close()
+
+			if err := waitForFileNotEmpty(outputFile); err != nil {
+				t.Fatalf("restored task never wrote output: %v", err)
+			}
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatalf("os.ReadFile: %v", err)
+			}
+			if string(got) != donated {
+				t.Errorf("restored task output = %q, want %q (fd 3 must read the pipe donated at restore)", string(got), donated)
+			}
+		})
+	}
+}
+
 func TestCheckpointRestoreBackToBack(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
 		t.Skip("Checkpoint not supported")
