@@ -29,6 +29,9 @@ go_test(
     name = "lisafs_test",
     size = "small",
     srcs = ["lisafs_test.go"],
+    data = [
+        "//pkg/lisafs:golden_corpus",
+    ],
     deps = [
         ":fsgofer",
         "//pkg/lisafs",

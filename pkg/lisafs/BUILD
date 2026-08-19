@@ -154,3 +154,76 @@ go_test(
     srcs = ["node_test.go"],
     library = ":lisafs",
 )
+
+
+# golden_corpus exposes the ABI golden vectors (real go_marshal outputs) for
+# the conformance test, the fuzz seed corpus, and the testsuite wire replay.
+filegroup(
+    name = "golden_corpus",
+    srcs = glob(["testdata/golden/*.bin"]),
+    visibility = ["//visibility:public"],
+)
+
+exports_files(
+    [
+        "ABI.md",
+        "message.go",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "abi_conformance_test",
+    size = "small",
+    srcs = ["abi_conformance_test.go"],
+    data = [
+        ":ABI.md",
+        ":golden_corpus",
+        ":message.go",
+    ],
+    library = ":lisafs",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/flipcall",
+        "//pkg/marshal/primitive",
+        "//pkg/unet",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+
+go_test(
+    name = "fuzz_test",
+    size = "medium",
+    srcs = ["fuzz_test.go"],
+    data = [":golden_corpus"],
+    library = ":lisafs",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/lisafs/testsupport",
+        "//pkg/unet",
+    ],
+)
+
+# plain_go_import_test proves that the plain-Go external-consumer surface
+# (pkg/lisafs, pkg/flipcall, pkg/fdchannel via the synthetic `go` branch
+# archive) builds and vets outside the repository. See the script header for
+# the environment it expects (a `go` toolchain on PATH and the three
+# golang.org/x modules in the ambient module cache).
+sh_test(
+    name = "plain_go_import_test",
+    srcs = ["plain_go_import_test.sh"],
+    args = [
+        "$(location //:gopath)",
+        "$(location //:go.mod)",
+        "$(location //:go.sum)",
+    ],
+    data = [
+        "//:gopath",
+        "//:go.mod",
+        "//:go.sum",
+    ],
+    tags = [
+        "manual",
+    ],
+)

@@ -1,4 +1,4 @@
-// Copyright 2023 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build arm64
-// +build arm64
+//go:build !linux
+// +build !linux
 
-package safecopy_test
+package memutil
 
-import (
-	"testing"
-)
+import "fmt"
 
-func TestDummy(t *testing.T) {
+// CreateMemFD creates a memfd file and returns the fd. It is only
+// implemented on Linux; non-Linux hosts fail closed (wave-05 backends
+// provide the shared-memory primitive behind flipcall's WindowAllocator
+// seam; see pkg/flipcall/SEAM.md).
+func CreateMemFD(name string, flags int) (int, error) {
+	return -1, fmt.Errorf("memfd_create is not supported on this platform")
 }
