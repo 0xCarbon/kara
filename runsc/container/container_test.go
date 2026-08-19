@@ -1531,6 +1531,13 @@ while :; do echo tick >> %q; sleep 1; done
 		trapContent, _ := os.ReadFile(trapFile.Name())
 		t.Fatalf("signal handler did not complete (read in trap): %v; trap file content (empty = signal never delivered/handler never entered): %q", err, trapContent)
 	}
+	// Sample a fresh baseline now that the handler has completed: progress
+	// accumulated before the signal must not satisfy the post-handler
+	// liveness check.
+	ticksAfterHandler, err := countLines(ticksFile.Name())
+	if err != nil {
+		t.Fatalf("error with ticks file: %v", err)
+	}
 	proof, err := os.ReadFile(proofFile.Name())
 	if err != nil {
 		t.Fatalf("error reading proof file: %v", err)
@@ -1543,7 +1550,7 @@ while :; do echo tick >> %q; sleep 1; done
 		if err != nil {
 			return err
 		}
-		if n <= lastTicks+3 {
+		if n <= ticksAfterHandler+2 {
 			return fmt.Errorf("main loop stalled after signal handler: ticks=%d", n)
 		}
 		return nil
@@ -1606,8 +1613,10 @@ func testCheckpointRestoreLongSleep(t *testing.T, conf *config.Config) {
 	defer outputFile.Close()
 
 	// The sleep deadline must fire long after the restore, while the
-	// container is otherwise silent.
-	script := fmt.Sprintf("echo start >> %q; sleep 15; echo done >> %q", outputFile.Name(), outputFile.Name())
+	// container is otherwise silent. The start marker is written only after
+	// the sleep child exists, so a visible "start" without "done" implies a
+	// pending sleep deadline (not a shell that has not reached sleep yet).
+	script := fmt.Sprintf("sleep 15 & p=$!; echo start >> %q; wait $p; echo done >> %q", outputFile.Name(), outputFile.Name())
 	spec := testutil.NewSpecWithArgs("bash", "-c", script)
 	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 	if err != nil {
@@ -1711,11 +1720,15 @@ func TestSignalUserspaceSpinTask(t *testing.T) {
 			}
 
 			// Wait until the task is actually spinning, then kill it. The
-			// task must die from SIGKILL (not from a crash), so capture the
-			// wait status.
+			// marker write proves the script reached the loop, but the shell
+			// may still be inside the write/close syscalls; dwell briefly so
+			// the signal exercises the syscall-free interrupt path. The task
+			// must die from SIGKILL (not from a crash), so capture the wait
+			// status.
 			if err := waitForFileNotEmpty(startFile); err != nil {
 				t.Fatalf("failed to wait for spin task to start: %v", err)
 			}
+			time.Sleep(1 * time.Second)
 			if err := cont.SignalContainer(unix.SIGKILL, false); err != nil {
 				t.Fatalf("error sending SIGKILL: %v", err)
 			}
