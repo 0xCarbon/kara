@@ -89,6 +89,7 @@ go_library(
         "//runsc/profile",
         "//runsc/sandbox",
         "//runsc/specutils",
+        "//runsc/compat",
         "//runsc/version",
         "//sandboxexec/proto:sandbox_options_go_proto",
         "@com_github_google_subcommands//:go_default_library",

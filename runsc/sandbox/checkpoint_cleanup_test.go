@@ -19,7 +19,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/state/checkpointfiles"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 )
@@ -153,7 +152,7 @@ func TestRemoveLocalSaveFiles(t *testing.T) {
 
 			opts := CheckpointOpts{Compression: tc.compression}
 			if tc.splitFS {
-				opts.SplitFSCheckpointPaths = []checkpoint.ResourceID{{ContainerName: "c", Path: "/tmp"}}
+				opts.SplitFSCheckpoint = true
 			}
 			if err := removeLocalSaveFiles(dir, opts); err != nil {
 				t.Fatalf("removeLocalSaveFiles: %v", err)

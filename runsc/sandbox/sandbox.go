@@ -1746,7 +1746,7 @@ func removeLocalSaveFiles(imagePath string, opts CheckpointOpts) error {
 			errs = append(errs, err)
 		}
 	}
-	if len(opts.SplitFSCheckpointPaths) > 0 {
+	if opts.SplitFSCheckpoint {
 		fsImagePath := filepath.Join(imagePath, "fs")
 		for _, name := range []string{checkpointfiles.FSCheckpointManifestFileName, checkpointfiles.FSCheckpointMultiTarFileName, checkpointfiles.PagesMetadataFileName, checkpointfiles.PagesFileName} {
 			if err := os.Remove(filepath.Join(fsImagePath, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -1793,11 +1793,14 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
 			for _, f := range files {
 				_ = f.Close()
 			}
-			// openFSCheckpointLocalFiles removes its own partial creations;
-			// remove the checkpoint files this call created as well, so no
-			// half-created image survives a failed checkpoint.
-			if rmErr := removeLocalSaveFiles(imagePath, opts); rmErr != nil {
-				log.Warningf("Failed to create fs checkpoint files (%v) and cleaning up the partially created checkpoint files at %q failed too: %v", err, imagePath, rmErr)
+			// openFSCheckpointLocalFiles removes its own partial creations
+			// under fs/. Remove only the top-level files THIS function
+			// created (createSaveFiles above), not removeLocalSaveFiles —
+			// the split-FS open may have failed because the fs/ directory
+			// already contained files we do not own, and deleting those
+			// would destroy a pre-existing checkpoint.
+			for _, f := range files {
+				_ = os.Remove(f.Name())
 			}
 			_ = os.Remove(fsImagePath)
 			return fmt.Errorf("creating fs checkpoint files: %w", err)

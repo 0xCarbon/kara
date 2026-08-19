@@ -63,9 +63,11 @@ type SaveRejection struct {
 	Err error
 }
 
-// Error implements error.
+// Error implements error. The original error already contains the
+// saveRejectionPrefix (it is the match condition), so return it verbatim
+// rather than re-prefixing.
 func (e *SaveRejection) Error() string {
-	return saveRejectionPrefix + ": " + e.Err.Error()
+	return e.Err.Error()
 }
 
 // Unwrap allows errors.Is/As to reach the original transport error.
@@ -121,7 +123,10 @@ func classifyCheckpointError(err error) error {
 	// urpc flattens transport errors to text; recognize the two signatures of
 	// a control connection to a dead sandbox.
 	if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) ||
-		strings.HasSuffix(msg, "failed: EOF") || strings.HasSuffix(msg, "failed: connection reset by peer") {
+		strings.HasSuffix(msg, "failed: EOF") || strings.HasSuffix(msg, "failed: connection reset by peer") ||
+		// Connect-time death: the sandbox exited before sandboxConnect ran.
+		strings.Contains(msg, "no control socket found") ||
+		strings.Contains(msg, "connecting to sandbox") {
 		return &SandboxDeath{Err: err}
 	}
 	return err

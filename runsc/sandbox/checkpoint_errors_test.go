@@ -127,8 +127,12 @@ func TestClassifyNil(t *testing.T) {
 // that log or persist the error string rely on it starting with the stable
 // rejection prefix.
 func TestSaveRejectionErrorShape(t *testing.T) {
-	e := &SaveRejection{Err: errors.New("detail text")}
-	want := saveRejectionPrefix + ": detail text"
+	// The original error (from classifyCheckpointError) already contains
+	// the rejection prefix; Error() returns it verbatim, so string
+	// consumers see the unchanged original message.
+	orig := errors.New(saveRejectionPrefix + ": detail text")
+	e := &SaveRejection{Err: orig}
+	want := orig.Error()
 	if got := e.Error(); got != want {
 		t.Errorf("SaveRejection.Error() = %q, want %q", got, want)
 	}

@@ -133,6 +133,11 @@ func CanonicalCPUFeatures() string {
 			features = append(features, v.String())
 		}
 	}
+	// Restore's FeatureSet.CheckHostCompatible also compares CacheLine()
+	// (pkg/cpuid/cpuid_amd64.go), which is not a Boolean feature; include
+	// it so two hosts with identical feature lists but different cache-line
+	// sizes produce different compatibility keys.
+	features = append(features, fmt.Sprintf("cache_line_size=%d", cpuid.HostFeatureSet().CacheLine()))
 	return strings.Join(features, ",")
 }
 
