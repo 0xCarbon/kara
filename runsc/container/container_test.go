@@ -1756,6 +1756,124 @@ func TestSignalUserspaceSpinTask(t *testing.T) {
 	}
 }
 
+// TestStateAfterInitKilled verifies that the container state settles to
+// "stopped" on its own after the init process is killed, without anyone
+// waiting on or destroying the container, and without anyone reaping the
+// sandbox process. A sandbox that exited but was never reaped remains a
+// zombie, and signal 0 succeeds on zombies, so liveness checks that rely on
+// signal 0 alone report the container as running forever.
+func TestStateAfterInitKilled(t *testing.T) {
+	// Deliberately do not start testutil.Reaper: the sandbox process must
+	// remain an unreaped zombie after it exits, as happens with detached
+	// sandboxes whose original parent is gone.
+	for name, conf := range configs(t, true /* noOverlay */) {
+		for _, restored := range []bool{false, true} {
+			sub := "fresh"
+			if restored {
+				if !testutil.IsCheckpointSupported() {
+					continue
+				}
+				sub = "restored"
+			}
+			t.Run(name+"-"+sub, func(t *testing.T) {
+				testStateAfterInitKilled(t, conf, restored)
+			})
+		}
+	}
+}
+
+// waitForProcessExit waits until the process with the given PID has exited
+// (i.e. it can no longer be found in /proc, or it is a zombie that has not
+// been reaped yet).
+func waitForProcessExit(pid int) error {
+	return testutil.Poll(func() error {
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			// The process is gone.
+			return nil
+		}
+		// The process state is the field following comm, which is enclosed
+		// in parentheses and may itself contain parentheses and spaces.
+		if i := strings.LastIndexByte(string(b), ')'); i >= 0 && i+2 < len(b) && b[i+2] != 'Z' {
+			return fmt.Errorf("process %d is still running", pid)
+		}
+		return nil
+	}, pollTimeout)
+}
+
+func testStateAfterInitKilled(t *testing.T, conf *config.Config, restored bool) {
+	spec := testutil.NewSpecWithArgs("sleep", "1000")
+	rootDir, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	origCont := cont
+	t.Cleanup(func() { origCont.Destroy() })
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	expectedPL := []*control.Process{newProcessBuilder().Cmd("sleep").Process()}
+	if err := waitForProcessList(cont, expectedPL); err != nil {
+		t.Fatalf("error waiting for container to start: %v", err)
+	}
+
+	if restored {
+		dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-state-test")
+		if err != nil {
+			t.Fatalf("os.MkdirTemp failed: %v", err)
+		}
+		defer os.RemoveAll(dir)
+		if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+			t.Fatalf("error checkpointing container: %v", err)
+		}
+		cont.Destroy()
+		cont = restoreIntoNewContainer(t, conf, spec, bundleDir, dir)
+		if err := waitForProcessList(cont, expectedPL); err != nil {
+			t.Fatalf("error waiting for restored container to start: %v", err)
+		}
+	}
+
+	// Kill the init process. The container state must settle to "stopped"
+	// without any further runtime call: nobody waits on the container and
+	// nobody reaps the sandbox process, so a zombie-blind liveness check
+	// would keep the container "running" forever.
+	sandboxPid := cont.Sandbox.Getpid()
+	if err := cont.SignalContainer(unix.SIGTERM, false); err != nil {
+		t.Fatalf("error sending SIGTERM to container: %v", err)
+	}
+	// Wait for the sandbox process to exit before asserting on the state:
+	// while its control server is still up, the sandbox may report the
+	// container as stopped on its own; the unreaped zombie sandbox left
+	// afterwards is the condition under test.
+	if err := waitForProcessExit(sandboxPid); err != nil {
+		t.Fatalf("sandbox process %d did not exit: %v", sandboxPid, err)
+	}
+	cid := cont.ID
+	if err := testutil.Poll(func() error {
+		c, err := Load(rootDir, FullID{ContainerID: cid}, LoadOpts{})
+		if err != nil {
+			return err
+		}
+		if got, want := c.Status, Stopped; got != want {
+			return fmt.Errorf("container status = %v, want %v", got, want)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Errorf("container state did not settle after init was killed: %v", err)
+	}
+}
+
 // TestCheckpointRestoreHostname verifies that hostname is updated on restore
 // if it was not changed inside the container, and is NOT updated if it was changed.
 func TestCheckpointRestoreHostname(t *testing.T) {
