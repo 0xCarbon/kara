@@ -160,8 +160,6 @@ func TestCommunicatorWindowSizing(t *testing.T) {
 }
 
 func TestFixedMessageLayouts(t *testing.T) {
-	stx := Statx{}
-	cc := createCommon{}
 	type pin struct {
 		name string
 		got  uintptr
@@ -183,10 +181,10 @@ func TestFixedMessageLayouts(t *testing.T) {
 		{"sizeof(OpenAtReq)", unsafe.Sizeof(OpenAtReq{}), 16},
 		{"offsetof(OpenAtReq.Flags)", unsafe.Offsetof(OpenAtReq{}.Flags), 8},
 		{"sizeof(OpenAtResp)", unsafe.Sizeof(OpenAtResp{}), 8},
-		{"sizeof(createCommon)", unsafe.Sizeof(cc), 24},
-		{"offsetof(createCommon.UID)", unsafe.Offsetof(cc.UID), 8},
-		{"offsetof(createCommon.GID)", unsafe.Offsetof(cc.GID), 12},
-		{"offsetof(createCommon.Mode)", unsafe.Offsetof(cc.Mode), 16},
+		{"sizeof(createCommon)", unsafe.Sizeof(createCommon{}), 24},
+		{"offsetof(createCommon.UID)", unsafe.Offsetof(createCommon{}.UID), 8},
+		{"offsetof(createCommon.GID)", unsafe.Offsetof(createCommon{}.GID), 12},
+		{"offsetof(createCommon.Mode)", unsafe.Offsetof(createCommon{}.Mode), 16},
 		{"sizeof(OpenCreateAtResp)", unsafe.Sizeof(OpenCreateAtResp{}), 160},
 		{"offsetof(OpenCreateAtResp.NewFD)", unsafe.Offsetof(OpenCreateAtResp{}.NewFD), 152},
 		{"sizeof(PReadReq)", unsafe.Sizeof(PReadReq{}), 24},
@@ -203,17 +201,17 @@ func TestFixedMessageLayouts(t *testing.T) {
 		{"offsetof(Getdents64Req.Count)", unsafe.Offsetof(Getdents64Req{}.Count), 8},
 		{"sizeof(StatxTimestamp)", unsafe.Sizeof(StatxTimestamp{}), 16},
 		{"offsetof(StatxTimestamp.Nsec)", unsafe.Offsetof(StatxTimestamp{}.Nsec), 8},
-		{"sizeof(Statx)", unsafe.Sizeof(stx), 144},
-		{"offsetof(Statx.Nlink)", unsafe.Offsetof(stx.Nlink), 16},
-		{"offsetof(Statx.Mode)", unsafe.Offsetof(stx.Mode), 28},
-		{"offsetof(Statx.Ino)", unsafe.Offsetof(stx.Ino), 32},
-		{"offsetof(Statx.AttributesMask)", unsafe.Offsetof(stx.AttributesMask), 56},
-		{"offsetof(Statx.Atime)", unsafe.Offsetof(stx.Atime), 64},
-		{"offsetof(Statx.Btime)", unsafe.Offsetof(stx.Btime), 80},
-		{"offsetof(Statx.Ctime)", unsafe.Offsetof(stx.Ctime), 96},
-		{"offsetof(Statx.Mtime)", unsafe.Offsetof(stx.Mtime), 112},
-		{"offsetof(Statx.RdevMajor)", unsafe.Offsetof(stx.RdevMajor), 128},
-		{"offsetof(Statx.DevMinor)", unsafe.Offsetof(stx.DevMinor), 140},
+		{"sizeof(Statx)", unsafe.Sizeof(Statx{}), 144},
+		{"offsetof(Statx.Nlink)", unsafe.Offsetof(Statx{}.Nlink), 16},
+		{"offsetof(Statx.Mode)", unsafe.Offsetof(Statx{}.Mode), 28},
+		{"offsetof(Statx.Ino)", unsafe.Offsetof(Statx{}.Ino), 32},
+		{"offsetof(Statx.AttributesMask)", unsafe.Offsetof(Statx{}.AttributesMask), 56},
+		{"offsetof(Statx.Atime)", unsafe.Offsetof(Statx{}.Atime), 64},
+		{"offsetof(Statx.Btime)", unsafe.Offsetof(Statx{}.Btime), 80},
+		{"offsetof(Statx.Ctime)", unsafe.Offsetof(Statx{}.Ctime), 96},
+		{"offsetof(Statx.Mtime)", unsafe.Offsetof(Statx{}.Mtime), 112},
+		{"offsetof(Statx.RdevMajor)", unsafe.Offsetof(Statx{}.RdevMajor), 128},
+		{"offsetof(Statx.DevMinor)", unsafe.Offsetof(Statx{}.DevMinor), 140},
 		{"sizeof(Inode)", unsafe.Sizeof(Inode{}), 152},
 		{"offsetof(Inode.Stat)", unsafe.Offsetof(Inode{}.Stat), 8},
 		{"sizeof(EmptyMessage)", unsafe.Sizeof(EmptyMessage{}), 0},

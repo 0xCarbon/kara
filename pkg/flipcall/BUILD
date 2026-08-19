@@ -11,6 +11,8 @@ go_library(
         "flipcall.go",
         "flipcall_unsafe.go",
         "futex_linux.go",
+        "futex_stub.go",
+        "seam.go",
         "io.go",
         "packet_window.go",
     ],
@@ -23,6 +25,13 @@ go_library(
         "//pkg/sync",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "flipcall_layout_test",
+    size = "small",
+    srcs = ["flipcall_layout_test.go"],
+    library = ":flipcall",
 )
 
 go_test(
