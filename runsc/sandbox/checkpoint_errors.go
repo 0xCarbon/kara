@@ -57,14 +57,19 @@ const saveRejectionPrefix = "save rejected due to unsupported networking state"
 // class). Such a sandbox is generally still kill-checkpointable by the
 // consumer; it is not a runsc defect.
 type SaveRejection struct {
-	// Detail is the underlying rejection reason text from the sandbox.
-	Detail string
+	// Err is the original flattened error (typically the urpc transport
+	// error carrying the sentry's rejection text); preserved for
+	// errors.Is/As and string consumers of the original message.
+	Err error
 }
 
 // Error implements error.
 func (e *SaveRejection) Error() string {
-	return saveRejectionPrefix + ": " + e.Detail
+	return saveRejectionPrefix + ": " + e.Err.Error()
 }
+
+// Unwrap allows errors.Is/As to reach the original transport error.
+func (e *SaveRejection) Unwrap() error { return e.Err }
 
 // SandboxDeath indicates the sandbox process died before the checkpoint RPC
 // completed (for example an unexpected sentry exit mid-save), so the image,
@@ -111,7 +116,7 @@ func classifyCheckpointError(err error) error {
 	// The rejection text may be embedded in the flattened urpc error message
 	// ("urpc method ... failed: <sentry error text>"), so locate it anywhere.
 	if idx := strings.Index(msg, saveRejectionPrefix+":"); idx >= 0 {
-		return &SaveRejection{Detail: strings.TrimSpace(msg[idx+len(saveRejectionPrefix)+1:])}
+		return &SaveRejection{Err: err}
 	}
 	// urpc flattens transport errors to text; recognize the two signatures of
 	// a control connection to a dead sandbox.

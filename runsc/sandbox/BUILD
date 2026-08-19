@@ -8,6 +8,7 @@ package(
 go_library(
     name = "sandbox",
     srcs = [
+        "checkpoint_errors.go",
         "network.go",
         "network_unsafe.go",
         "no_xdp.go",
@@ -72,11 +73,14 @@ go_test(
     name = "sandbox_test",
     size = "small",
     srcs = [
+        "checkpoint_cleanup_test.go",
+        "checkpoint_errors_test.go",
         "network_test.go",
         "sandbox_zombie_test.go",
     ],
     library = ":sandbox",
     deps = [
+        "//pkg/tcpip",
         "//runsc/boot",
         "//runsc/config",
         "@com_github_vishvananda_netlink//:go_default_library",

@@ -1949,6 +1949,10 @@ func setFSSaveArgsForLocalCheckpointFiles(conf *config.Config, imagePath string,
 func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([]*os.File, error) {
 	var files [4]*os.File
 	var createdPaths []string
+	// Only files this call CREATED may be removed on failure: the restore
+	// path calls this with O_RDONLY on pre-existing image files, which must
+	// never be deleted (a restore failure must not destroy the checkpoint).
+	mayRemove := openFlags&os.O_CREATE != 0
 	closeCleanup := cleanup.Make(func() {
 		for _, f := range files {
 			if f != nil {
@@ -1957,8 +1961,10 @@ func openFSCheckpointLocalFiles(imagePath string, openFlags int, direct bool) ([
 		}
 		// Remove partial creations so a retried checkpoint does not hit
 		// O_EXCL leftovers and no half-created image is ever observable.
-		for _, p := range createdPaths {
-			_ = os.Remove(p)
+		if mayRemove {
+			for _, p := range createdPaths {
+				_ = os.Remove(p)
+			}
 		}
 	})
 	defer closeCleanup.Clean()

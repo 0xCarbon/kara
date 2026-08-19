@@ -103,10 +103,10 @@ func TestClassifyCheckpointError(t *testing.T) {
 			if !strings.Contains(got.Error(), tc.wantContain) {
 				t.Errorf("classified error %q does not contain %q", got.Error(), tc.wantContain)
 			}
-			// The original error must stay reachable through the wrap chain
-			// except for rejections, which are reconstructed from text
-			// (only the string crosses the RPC boundary).
-			if !tc.wantReject && !errors.Is(got, tc.in) && tc.in != io.EOF {
+			// The original error must stay reachable through the wrap
+			// chain for every classification (rejections preserve the
+			// original via Unwrap, like deaths).
+			if !errors.Is(got, tc.in) && tc.in != io.EOF {
 				t.Errorf("errors.Is(classified, original) = false for %v", got)
 			}
 		})
@@ -127,7 +127,7 @@ func TestClassifyNil(t *testing.T) {
 // that log or persist the error string rely on it starting with the stable
 // rejection prefix.
 func TestSaveRejectionErrorShape(t *testing.T) {
-	e := &SaveRejection{Detail: "detail text"}
+	e := &SaveRejection{Err: errors.New("detail text")}
 	want := saveRejectionPrefix + ": detail text"
 	if got := e.Error(); got != want {
 		t.Errorf("SaveRejection.Error() = %q, want %q", got, want)
