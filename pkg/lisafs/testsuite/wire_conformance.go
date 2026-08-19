@@ -117,21 +117,47 @@ func sndRawFrame(t *testing.T, sock *unet.Socket, m lisafs.MID, payload []byte) 
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint16(frame[4:6], uint16(m))
 	copy(frame[8:], payload)
-	if _, err := sock.Write(frame); err != nil {
+	if err := writeAllFrames(sock, frame); err != nil {
 		t.Fatalf("writing MID %d frame: %v", m, err)
 	}
 
 	var hdr [8]byte
-	if n, err := sock.Read(hdr[:]); err != nil || n != 8 {
+	if n, err := readFullFrames(sock, hdr[:]); err != nil || n != 8 {
 		t.Fatalf("reading response header: n=%d err=%v", n, err)
 	}
 	respMID := lisafs.MID(binary.LittleEndian.Uint16(hdr[4:6]))
 	payloadLen := binary.LittleEndian.Uint32(hdr[0:4])
 	if payloadLen > 0 {
 		buf := make([]byte, payloadLen)
-		if n, err := sock.Read(buf); err != nil || uint32(n) != payloadLen {
+		if n, err := readFullFrames(sock, buf); err != nil || uint32(n) != payloadLen {
 			t.Fatalf("reading response payload: n=%d want=%d err=%v", n, payloadLen, err)
 		}
 	}
 	return respMID, payloadLen
+}
+
+// writeAllFrames sends the complete buffer; a stream write may be short.
+func writeAllFrames(sock *unet.Socket, b []byte) error {
+	for len(b) > 0 {
+		n, err := sock.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
+// readFullFrames reads exactly len(b) bytes.
+func readFullFrames(sock *unet.Socket, b []byte) (int, error) {
+	total := 0
+	for len(b) > 0 {
+		n, err := sock.Read(b)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		b = b[n:]
+	}
+	return total, nil
 }

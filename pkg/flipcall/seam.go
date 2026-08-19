@@ -51,7 +51,10 @@ type Sleeper interface {
 //
 // Allocate returns a descriptor whose FD is the shared memory file, Offset
 // the page-aligned start of the window within that file, and Length the
-// page-rounded window size. Allocate must be safe for concurrent use.
+// page-rounded window size. Implementations are not required to be safe
+// for concurrent use; callers allocate windows during channel setup, before
+// the window is shared with a peer. (The current Linux allocator is not
+// internally synchronized.)
 type WindowAllocator interface {
 	// Allocate allocates a new packet window of at least size bytes.
 	// Preconditions: size > 0.

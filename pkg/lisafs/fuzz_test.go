@@ -44,8 +44,20 @@ func (fuzzConnImpl) Mount(c *Connection, mountNode *Node) (*ControlFD, Statx, in
 	root.Init(c, mountNode, linux.ModeDirectory, root)
 	return root.FD(), Statx{Mode: uint16(linux.S_IFDIR)}, -1, nil
 }
-func (fuzzConnImpl) MaxMessageSize() uint32   { return MaxMessageSize() }
-func (fuzzConnImpl) SupportedMessages() []MID { return []MID{Mount, Channel} }
+func (fuzzConnImpl) MaxMessageSize() uint32 { return MaxMessageSize() }
+func (fuzzConnImpl) SupportedMessages() []MID {
+	// Advertise the standard handler set (mirroring fsgofer's, minus
+	// device-only paths) so the dispatch fuzzer reaches the request
+	// unmarshalling and handlers for standard MIDs, not just
+	// Mount/Channel (UnsupportedMessage exits early otherwise).
+	return []MID{
+		Mount, Channel, FStat, SetStat, Walk, WalkStat, OpenAt,
+		OpenCreateAt, Close, FSync, PWrite, PRead, MkdirAt, MknodAt,
+		SymlinkAt, LinkAt, FStatFS, FAllocate, ReadLinkAt, Connect,
+		UnlinkAt, RenameAt, Getdents64, FGetXattr, FSetXattr,
+		FListXattr, FRemoveXattr, FSync, RenameAt2,
+	}
+}
 
 // unmarshalTargets are the wire types whose CheckedUnmarshal must never
 // panic on attacker-controlled bytes. Each entry constructs a fresh value,
@@ -175,7 +187,7 @@ func serverDispatchBody(t testing.TB, b []byte) {
 	frame := make([]byte, 8+len(payload))
 	binary.LittleEndian.PutUint32(frame[0:4], uint32(len(payload)))
 	binary.LittleEndian.PutUint16(frame[4:6], uint16(mid))
-	if _, err := clientSock.Write(frame); err != nil {
+	if err := writeAll(clientSock, frame); err != nil {
 		clientSock.Close()
 		s.Destroy()
 		t.Fatalf("writing frame: %v", err)
@@ -190,7 +202,7 @@ func serverDispatchBody(t testing.TB, b []byte) {
 	r := resp{done: make(chan struct{})}
 	go func() {
 		defer close(r.done)
-		r.n, r.err = clientSock.Read(r.hdr[:])
+		r.n, r.err = readFull(clientSock, r.hdr[:])
 	}()
 	select {
 	case <-r.done:
@@ -215,7 +227,9 @@ func serverDispatchBody(t testing.TB, b []byte) {
 		// Drain the announced payload so the server is not blocked.
 		if payloadLen > 0 {
 			buf := make([]byte, payloadLen)
-			clientSock.Read(buf)
+			if err := readAll(clientSock, buf); err != nil {
+				t.Errorf("MID %d: draining response payload: %v", mid, err)
+			}
 		}
 	}
 
@@ -258,4 +272,36 @@ func TestServerDispatchSeedCorpus(t *testing.T) {
 	} {
 		serverDispatchBody(t, s)
 	}
+}
+
+// writeAll sends the complete buffer; a stream socket write may be short.
+func writeAll(sock *unet.Socket, b []byte) error {
+	for len(b) > 0 {
+		n, err := sock.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
+// readFull reads exactly len(b) bytes or returns an error.
+func readFull(sock *unet.Socket, b []byte) (int, error) {
+	total := 0
+	for len(b) > 0 {
+		n, err := sock.Read(b)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		b = b[n:]
+	}
+	return total, nil
+}
+
+// readAll is readFull without the count.
+func readAll(sock *unet.Socket, b []byte) error {
+	_, err := readFull(sock, b)
+	return err
 }

@@ -199,8 +199,12 @@ go 1.26
 
 require gvisor.dev/gvisor v0.0.0-00010101000000-000000000000
 
-// Any commit on the `go` branch works as the replacement version.
-replace gvisor.dev/gvisor => github.com/0xCarbon/bVisor <go-branch-sha>
+// A go-branch commit, referenced by pseudo-version (commit must be reachable
+// in the repository). Generate it with:
+//   go mod download github.com/0xCarbon/bVisor@<go-branch-sha>   # or:
+//   GOPRIVATE=github.com/0xCarbon/bVisor go get github.com/0xCarbon/bVisor@<go-branch-sha>
+// which resolves to v0.0.0-<yyyymmddhhmmss>-<12hex-prefix>.
+replace gvisor.dev/gvisor => github.com/0xCarbon/bVisor v0.0.0-20260819000000-000000000000
 ```
 
 ```go

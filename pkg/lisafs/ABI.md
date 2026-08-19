@@ -56,7 +56,12 @@ disagree, the code is wrong *or the ABI was broken* — either way CI must fail.
 A connection multiplexes one control socket and up to `maxChannels` fast
 channels. The wire format of a message depends on the communicator carrying it.
 
-### Control socket (UDS, `SOCK_SEQPACKET`)
+### Control socket (UDS, `SOCK_STREAM`)
+
+The control socket is a stream socket: frames are delimited only by the
+8-byte sock header (MID + payload length), not by datagram boundaries.
+Peers must buffer partial reads and must not rely on packet boundaries.
+(FD donation uses a separate `SOCK_SEQPACKET` `fdchannel` socket.)
 
 ```
 offset  size  field
@@ -210,16 +215,16 @@ the wire). Dynamic fields are marked `dyn`.
 | 2 | Channel | `EmptyMessage` → `ChannelResp` + 2 donated FDs (window memfd, fdchannel socket) |
 | 3 | FStat | `StatReq`: `u64 FD` (8 B) → `Statx` (144 B) |
 | 4 | SetStat | `SetStatReq` (64 B): `u64 FD`@0, `u32 Mask`@8, `u32 Mode`@12, `u32 UID`@16, `u32 GID`@20, `u64 Size`@24, `Timespec Atime`@32, `Mtime`@48 → `SetStatResp` (8 B): `u32 FailureMask`@0, `u32 FailureErrNo`@4 |
-| 5 | Walk | `WalkReq`: `u64 DirFD` + `dyn StringArray Path` → `WalkResp`: `i32 Status` + `u16 count` + `count × Inode` |
+| 5 | Walk | `WalkReq`: `u64 DirFD` + `dyn StringArray Path` → `WalkResp`: `u8 Status` + `pad u8` + `u16 count` + `count × Inode` |
 | 6 | WalkStat | same request → `u16 count` + `count × Statx` |
 | 7 | OpenAt | `OpenAtReq` (16 B): `u64 FD`@0, `u32 Flags`@8, `pad u32`@12 → `OpenAtResp`: `u64 OpenFD` (8 B) |
-| 8 | OpenCreateAt | `createCommon` + `dyn SizedString Name` → `OpenCreateAtResp` (160 B): `Inode Child`@0, `u64 NewFD`@152 |
+| 8 | OpenCreateAt | `createCommon` + `u32 Flags`@24 + `dyn SizedString Name` → `OpenCreateAtResp` (160 B): `Inode Child`@0, `u64 NewFD`@152 |
 | 9 | Close | `dyn FdArray FDs` → `EmptyMessage` |
-| 10 | FSync | `StatReq`-shaped `u64 FD` → `EmptyMessage` |
+| 10 | FSync | `dyn FdArray FDs` → `EmptyMessage` |
 | 11 | PWrite | `u64 Offset` + `u64 FD` + `u32 NumBytes` + `dyn NumBytes bytes` (no trailing pad) → `u64 Count` (8 B) |
 | 12 | PRead | `PReadReq` (24 B): `u64 Offset`@0, `u64 FD`@8, `u32 Count`@16, `pad u32`@20 → `u64 NumBytes` + `dyn NumBytes bytes` |
 | 13 | MkdirAt | `createCommon` + `dyn SizedString` → `Inode ChildDir` |
-| 14 | MknodAt | `createCommon` + `SizedString` → `Inode Child` |
+| 14 | MknodAt | `createCommon` + `u32 Minor`@24 + `u32 Major`@28 + `dyn SizedString Name` → `Inode Child` |
 | 15 | SymlinkAt | `u64 DirFD` + `u32 UID`+`u32 GID` + `dyn SizedString Name` + `dyn SizedString Target` → `Inode Symlink` |
 | 16 | LinkAt | `u64 DirFD` + `u64 Target` + `dyn SizedString Name` → `Inode Link` |
 | 17 | FStatFS | `u64 FD` → `StatFS` (64 B): 8 × u64 fields |
@@ -234,14 +239,15 @@ the wire). Dynamic fields are marked `dyn`.
 | 26 | FSetXattr | `u64 FD` + `u32 Flags` + `dyn SizedString Name` + `dyn SizedString Value` → `EmptyMessage` |
 | 27 | FListXattr | `u64 FD` + `u64 Size` → `dyn StringArray` |
 | 28 | FRemoveXattr | `u64 FD` + `dyn SizedString Name` → `EmptyMessage` |
-| 29 | BindAt | `u64 DirFD` + `u32 SockType` + `dyn SizedString Name` → `Inode Child` + `u64 BoundSocketFD` |
+| 29 | BindAt | `createCommon` + `u32 SockType`@24 + `dyn SizedString Name` → `Inode Child` + `u64 BoundSocketFD` |
 | 30 | Listen | `ListenReq` (16 B): `u64 FD`@0, `i32 Backlog`@8, `pad u32`@12 → `EmptyMessage` |
-| 31 | Accept | `u64 FD` → `u64 NewFD` (+ donated socket FD) |
+| 31 | Accept | `u64 FD` → `dyn SizedString PeerAddr` (+ donated socket FD via fdchannel) |
 | 32 | ConnectWithCreds | `ConnectReq` + `u32 UID` + `u32 GID` (24 B) → `EmptyMessage` |
 | 33 | RenameAt2 | `RenameAtReq` + `u32 Flags` → `EmptyMessage` |
 
-Dirent64 entries use the `struct linux_dirent64` layout (`u64 ino`, `s64 off`,
-`u16 reclen`, `u8 type`, name, NUL, padding to 8).
+Dirent64 entries (variable size): `u64 Ino`@0, `u32 DevMinor`@8, `u32 DevMajor`@12,
+`u64 Off`@16, `u8 Type`@24, `pad`@25 (alignment to `u16`), `u16 NameLen`@26,
+`NameLen bytes Name`@28 (no trailing pad).
 
 ## Golden corpus
 
