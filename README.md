@@ -1,225 +1,130 @@
-![gVisor](g3doc/logo.png)
+<div align="center">
 
-[![Build status](https://badge.buildkite.com/3b159f20b9830461a71112566c4171c0bdfd2f980a8e4c0ae6.svg?branch=master)](https://buildkite.com/gvisor/pipeline)
-[![Issue reviver](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml)
-[![CodeQL](https://github.com/google/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/codeql.yml)
-[![gVisor chat](https://badges.gitter.im/gvisor/community.png)](https://gitter.im/gvisor/community)
-[![code search](https://img.shields.io/badge/code-search-blue)](https://cs.opensource.google/gvisor/gvisor)
+# Kara
 
-## What is gVisor?
+**The sandbox kernel for [`oca`](https://github.com/0xCarbon/oca) — a [`gVisor`](https://github.com/google/gvisor) fork extended beyond Linux-only hosts.**
 
-**gVisor** provides a strong layer of isolation between running applications and
-the host operating system. It is an application kernel that implements a
-[Linux-like interface][linux]. Unlike Linux, it is written in a memory-safe
-language (Go) and runs in userspace.
+*Kara — Tupi-Guarani for skin, bark, husk: the layer that wraps and protects what lives inside.*
 
-gVisor includes an [Open Container Initiative (OCI)][oci] runtime called `runsc`
-that makes it easy to work with existing container tooling. The `runsc` runtime
-integrates with Docker and Kubernetes, making it simple to run sandboxed
-containers.
+<p>
+  <a href="https://github.com/google/gvisor">
+    <img src="https://img.shields.io/badge/fork%20of-google%2Fgvisor-blue" alt="fork of google/gvisor">
+  </a>
+  &nbsp;
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="Apache-2.0">
+  </a>
+</p>
 
-## What **isn't** gVisor?
+</div>
 
-*   gVisor is **not a syscall filter** (e.g. `seccomp-bpf`), nor a wrapper over
-    Linux isolation primitives (e.g. `firejail`, AppArmor, etc.).
-*   gVisor is also **not a VM** in the everyday sense of the term (e.g.
-    VirtualBox, QEMU).
+<br />
 
-**gVisor takes a distinct third approach**, providing many security benefits of
-VMs while maintaining the lower resource footprint, fast startup, and
-flexibility of regular userspace applications.
+## Overview
 
-## Why does gVisor exist?
+Kara is 0xCarbon's fork of [gVisor](https://github.com/google/gvisor), the
+user-space kernel that implements the Linux system surface and isolates
+workloads from the host. The fork's mission: serve as the **sandbox kernel
+for the [`oca`](https://github.com/0xCarbon/oca) agent runtime** — and keep
+being that kernel on **macOS and Windows**, not only Linux, by lifting the
+host-platform seam instead of forking the sentry with `#ifdef`s.
 
-Containers are not a [**sandbox**][sandbox]. While containers have
-revolutionized how we develop, package, and deploy applications, using them to
-run untrusted or potentially malicious code without additional isolation is not
-a good idea. While using a single, shared kernel allows for efficiency and
-performance gains, it also means that container escape is possible with a single
-vulnerability.
+Upstream merges land regularly; the fork delta is kept minimal, reviewed, and
+rebasable (see [Fork delta](#fork-delta) and
+[Upstream policy](#upstream-policy)).
 
-gVisor is an application kernel for containers. It limits the host kernel
-surface accessible to the application while still giving the application access
-to all the features it expects. Unlike most kernels, gVisor does not assume or
-require a fixed set of physical resources; instead, it leverages existing host
-kernel functionality and runs as a normal process. In other words, gVisor
-implements Linux by way of Linux.
+### Key features
 
-gVisor should not be confused with technologies and tools to harden containers
-against external threats, provide additional integrity checks, or limit the
-scope of access for a service. One should always be careful about what data is
-made available to a container.
+- **Egress flow gate** (`--egress-fd`) &mdash; pre-route TCP/UDP admission with
+  bounded L7 prefix mirroring, a fail-closed sentry-side client speaking a
+  frozen wire format, and enforcement that **survives checkpoint/restore**
+  across every network namespace.
+- **External gofer** (`--io-fds`) &mdash; create/run/restore accept donated
+  lisafs connections so an embedder can serve the sandbox filesystem from its
+  own gofer process.
+- **Gofer-monitor grace** &mdash; bounded 2 s grace with clean-exit detection
+  before SIGKILL on gofer disconnect.
+- **C/R contract hardening** &mdash; zombie-aware sandbox liveness, restore
+  wedge regressions pinned by tests, held egress flows terminate at restore
+  (never resume unclassified).
+- **Plain-Go `pkg/lisafs` + `pkg/flipcall`** &mdash; importable without bazel,
+  with the wire ABI frozen and machine-checked (third-party gofer
+  enablement).
+- **Host-platform seam** *(in progress)* &mdash; Linux-only control plane made
+  optional behind capability probes so Hypervisor.framework and WHP backends
+  can land without sentry-wide conditionals.
 
-## Documentation
+## Kara and oca
 
-User documentation and technical architecture, including quick start guides, can
-be found at [gvisor.dev][gvisor-dev].
+[`oca`](https://github.com/0xCarbon/oca) is the agent sandbox runtime that
+consumes Kara: it drives `runsc` with donated gofer FDs and an egress gate,
+and suspends/resumes agents through checkpoint/restore. Oca owns the agent
+lifecycle; Kara owns the kernel it runs on. The end state: **oca builds
+against Kara master with zero ocadiff patches**.
 
-## Installing from source
+## Getting started
 
-gVisor builds on x86_64 and ARM64. Other architectures may become available in
-the future.
+Kara builds like gVisor. The quick path:
 
-For the purposes of these instructions, [bazel][bazel] and other build
-dependencies are wrapped in a build container. It is possible to use
-[bazel][bazel] directly, or type `make help` for standard targets.
+```bash
+git clone https://github.com/0xCarbon/kara
+cd kara
 
-### Requirements
+# bazel (authoritative; regenerates stateify autogen)
+bazel build //runsc:runsc
 
-Make sure the following dependencies are installed:
-
-*   Linux 5.6+
-*   [Docker version 17.09.0 or greater][docker]
-
-### Building
-
-Build a release tarball containing `runsc`, the `containerd-shim-runsc-v1`
-containerd shim, and a few sidecar binaries that `runsc` expects to find in a
-`gvisor-bin/` directory next to itself, then extract it to `/usr/local/bin`:
-
-```sh
-make release-tarball DESTINATION=bin/
-sudo tar -C /usr/local/bin -xf bin/gvisor.tar.bz2
+# run a sandbox with the egress gate + an external gofer
+runsc --network=sandbox --overlay2=none --directfs=false \
+  create -bundle /path/to/bundle --io-fds=3 --egress-fd=4 my-sandbox
 ```
 
-To build specific libraries or binaries, you can specify the target:
+Plain-Go consumers of `pkg/lisafs` / `pkg/flipcall` need no bazel at all —
+see the packages' doc headers for the frozen ABI contract.
 
-```sh
-make build TARGETS="//pkg/tcpip:tcpip"
-```
+For gVisor's full user, installation, and debugging documentation, see
+[`g3doc/`](g3doc/) (inherited from upstream).
 
-### Building directly with Bazel (without Docker)
+## Fork delta
 
-Using Bazel directly isn't recommended due to the extra overhead, but in order
-to get started:
+| Area | What changed | Landed as |
+|------|--------------|-----------|
+| `runsc/container` | C/R signal-handler & task-liveness regression tests (gvisor#14139 investigation) | PR #1 |
+| `runsc/sandbox` | zombie-aware `IsRunning` (state settles after init death) | PR #2 |
+| netstack + runsc | external gofer `--io-fds`, gofer-monitor grace, egress flow gate `--egress-fd` (+ restore-survival, fail-closed config validation) | PR #3 |
+| `pkg/lisafs`, `pkg/flipcall` | plain-Go surface, frozen wire ABI + fuzz/golden conformance, host-primitive seam | PR #4 |
 
--   Look at the [build dockerfile](images/default/Dockerfile) for the canonical
-    list of needed dependencies.
--   Install and use [bazelisk][bazelisk]. Otherwise, make sure your bazel
-    version matches the one listed in the [.bazelversion](.bazelversion) file.
+Roadmap: checkpoint/restore contract API hardening, the full host-platform
+seam lift (macOS/Windows pre-work), and embeddable library mode + the oca
+managed-e2e suite as CI gates.
 
-After setting up dependencies, using Bazel is similar to the Makefile:
+## Upstream policy
 
-```sh
-bazel build -c opt //debian:gvisor-release-tar
-```
-
-### Testing
-
-To run standard test suites, you can use:
-
-```sh
-make unit-tests
-make tests
-```
-
-To run specific tests, you can specify the target:
-
-```sh
-# Makefile
-make test TARGETS="//runsc:version_test"
-# Bazel
-bazel test //runsc:version_test
-```
-
-### Mac OS
-
-Some packages support running tests directly on macOS. At the time of this
-writing, gVisor requires bazel 8, which you can install via homebrew:
-
-```sh
-brew install bazel@8
-
-# You can then run the tests, e.g.:
-$(brew --prefix bazel@8)/bin/bazel test --macos_sdk_version=$(xcrun --show-sdk-version) -- //tools/nogo/... //tools/check{aligned,const,escape,linkname,locks,unsafe}/...
-```
-
-### Using `go get`
-
-This project uses [bazel][bazel] to build and manage dependencies. A synthetic
-`go` branch is maintained that is compatible with standard `go` tooling for
-convenience. This is useful for external packages and libraries that depend on
-gVisor subpackages (e.g. userspace networking via Netstack) to import gVisor Go
-code into their Go projects.
-
-**NOTE**: **`runsc` builds from this branch are not supported**. gVisor and
-`runsc` require several binaries (some of which are not even written in Go) in
-order to function. The `go` branch is supported in a best effort capacity, and
-direct development on this branch is not supported. Development should occur on
-the `master` branch, which is then reflected into the `go` branch.
-
-## Community & Governance
-
-See [GOVERNANCE.md](GOVERNANCE.md) for project governance information.
-
-The [gvisor-users mailing list][gvisor-users-list] and
-[gvisor-dev mailing list][gvisor-dev-list] are good starting points for
-questions and discussion.
-
-## Security Policy
-
-See [SECURITY.md](SECURITY.md).
+- `upstream` = `google/gvisor` `master`; syncs are merge commits, gated by
+  `bazel build //runsc:runsc` plus the fork's test targets before push.
+- The fork never rewinds upstream behavior: fork features fail closed and
+  stay no-ops when their flags are unset (nil gate / no `--io-fds` = stock).
+- Wire formats and ABI surfaces the fork introduces (`EgressGate` protocol,
+  LISAFS ABI) are contractual and frozen.
 
 ## Contributing
 
-See [Contributing.md](CONTRIBUTING.md).
+Small, reviewable, wave-shaped changes. See
+[CONTRIBUTING.md](CONTRIBUTING.md) (inherited) for the basics; open an issue
+first for anything that touches the sentry or the platform seam.
 
-[bazel]: https://bazel.build
-[docker]: https://www.docker.com
-[gvisor-users-list]: https://groups.google.com/forum/#!forum/gvisor-users
-[gvisor-dev]: https://gvisor.dev
-[gvisor-dev-list]: https://groups.google.com/forum/#!forum/gvisor-dev
-[linux]: https://en.wikipedia.org/wiki/Linux_kernel_interfaces
-[oci]: https://www.opencontainers.org
-[sandbox]: https://en.wikipedia.org/wiki/Sandbox_(computer_security)
-[bazelisk]: https://github.com/bazelbuild/bazelisk
+## Security
 
-## Using bVisor Go packages from external modules (0xCarbon fork)
+See [SECURITY.md](SECURITY.md). Kara inherits gVisor's attack-surface
+posture and adds its own rule: **sandbox egress enforcement must fail
+closed** — an unconfigurable or unrestorable gate is a boot or restore
+failure, never a silent pass-through.
 
-The `go` branch is the supported surface for consuming bVisor packages from
-plain Go modules, without bazel. It is a synthetic branch, generated by
-[`tools/go_branch.sh`](tools/go_branch.sh) from the `//:gopath` archive, that
-contains all Go sources — including the code bazel normally generates
-(`go_marshal` wire codecs, stateify save/restore, reference-count template
-instances) — plus the repository's `go.mod`/`go.sum`. It is what
-`pkg/lisafs` (LISAFS wire protocol), `pkg/flipcall` and `pkg/fdchannel`
-consumers, such as third-party gofers, should build against. Do not depend on
-the `master` tree directly: it does not contain generated code and is not
-plain-`go build`-able.
+## Code of conduct
 
-The branch's `go.mod` keeps the module path `gvisor.dev/gvisor`, so an
-external module imports the packages under their upstream paths and pins the
-fork with a `replace` directive pointing at the `go` branch commit it wants:
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) (inherited).
 
-```go.mod
-module example.com/mygofer
+## Acknowledgements
 
-go 1.26
-
-require gvisor.dev/gvisor v0.0.0-00010101000000-000000000000
-
-// A go-branch commit, referenced by pseudo-version (commit must be reachable
-// in the repository). Generate it with:
-//   go mod download github.com/0xCarbon/bVisor@<go-branch-sha>   # or:
-//   GOPRIVATE=github.com/0xCarbon/bVisor go get github.com/0xCarbon/bVisor@<go-branch-sha>
-// which resolves to v0.0.0-<yyyymmddhhmmss>-<12hex-prefix>.
-replace gvisor.dev/gvisor => github.com/0xCarbon/bVisor v0.0.0-20260819000000-000000000000
-```
-
-```go
-import (
-    "gvisor.dev/gvisor/pkg/fdchannel"
-    "gvisor.dev/gvisor/pkg/flipcall"
-    "gvisor.dev/gvisor/pkg/lisafs"
-)
-```
-
-This surface is continuously verified out-of-tree by
-`bazel test //pkg/lisafs:plain_go_import_test`, which unzips the `//:gopath`
-archive, materializes the module exactly like the `go` branch does, and builds
-and vets a consumer module that imports all three packages with `GOPROXY=off`
-(the `.github/workflows/go.yml` `plain-go-consumer` job runs it on every PR).
-The test needs a `go` toolchain on `PATH` and the `golang.org/x/sys` and
-`golang.org/x/time` modules in the local module cache (`go mod download`) —
-the non-stdlib dependencies of that import closure (`golang.org/x/exp` is
-fetched defensively in case the closure drifts).
+Kara stands on [gVisor](https://github.com/google/gvisor) and its community.
+The name follows 0xCarbon's indigenous-Brazilian naming — *kene, taba, ajuri,
+oca, aba, kara*.
