@@ -1603,16 +1603,31 @@ func (l *Loader) startGoferMonitor(info *containerInfo) {
 			panic(fmt.Sprintf("Error monitoring gofer FDs: %s", err))
 		}
 
-		l.mu.Lock()
-		defer l.mu.Unlock()
-
-		// The gofer could have been stopped due to a normal container shutdown.
-		// Check if the container has not stopped yet.
-		if tg, _ := l.tryThreadGroupFromIDLocked(execID{cid: info.cid}); tg != nil {
-			log.Infof("Gofer socket disconnected, killing container %q", info.cid)
-			if err := l.signalAllProcesses(info.cid, int32(linux.SIGKILL)); err != nil {
-				log.Warningf("Error killing container %q after gofer stopped: %s", info.cid, err)
+		// External-gofer teardown race (Oca #358): the gofer connection can
+		// disconnect a moment before the init task is fully reaped during a
+		// NORMAL container exit. Give the container a short grace period to stop
+		// before treating the disconnect as a gofer failure worth SIGKILLing over
+		// — otherwise we kill a cleanly-exiting container, corrupt the control
+		// server, and leave runsc state stuck at "running". A genuinely dead
+		// gofer (container still running after the grace) is still killed.
+		deadline := gtime.Now().Add(2 * gtime.Second)
+		for {
+			l.mu.Lock()
+			tg, _ := l.tryThreadGroupFromIDLocked(execID{cid: info.cid})
+			if tg == nil {
+				l.mu.Unlock()
+				return
 			}
+			if gtime.Now().After(deadline) {
+				log.Infof("Gofer socket disconnected, killing container %q", info.cid)
+				if err := l.signalAllProcesses(info.cid, int32(linux.SIGKILL)); err != nil {
+					log.Warningf("Error killing container %q after gofer stopped: %s", info.cid, err)
+				}
+				l.mu.Unlock()
+				return
+			}
+			l.mu.Unlock()
+			gtime.Sleep(50 * gtime.Millisecond)
 		}
 	}()
 }
