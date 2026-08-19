@@ -198,3 +198,16 @@ go_test(
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
+
+go_test(
+    name = "egress_gate_test",
+    size = "small",
+    srcs = ["egress_gate_test.go"],
+    library = ":boot",
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/stack",
+        "//runsc/config",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)

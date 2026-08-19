@@ -1,0 +1,237 @@
+# kara-regression: the fork's regression suite and the oca e2e trigger.
+#
+# Jobs:
+#   unit          - every bazel-visible test target the fork added or
+#                   changed over waves 01-06 (unprivileged).
+#   container-root- the root-required container regression subset plus the
+#                   runsc/library reference embedder suite, run as root
+#                   against a bazel-built static runsc via the validated
+#                   _main runfiles layout (tools/kara_regression.sh), on
+#                   the systrap and kvm platforms.
+#   oca-e2e       - manual / cross-repo-triggered: checks out the private
+#                   oca repository at a ref, builds a fresh kara runsc and
+#                   runs oca's managed-mode e2e suite against it. This is
+#                   the kara-side half of the cross-repo contract: it
+#                   catches kara changes that break oca BEFORE oca's own
+#                   nightly notices.
+#
+# Cross-repo trigger (oca -> kara):
+#   repository_dispatch event "oca-e2e", payload {"ref": "<oca ref>"}:
+#
+#     curl -X POST \
+#       -H "Authorization: token $PAT" \
+#       -H "Accept: application/vnd.github.v3+json" \
+#       https://api.github.com/repos/0xCarbon/kara/dispatches \
+#       -d '{"event_type":"oca-e2e","client_payload":{"ref":"main"}}'
+#
+#   The PAT needs Contents:write on 0xCarbon/kara (fine-grained token of a
+#   user/machine account with that single permission is enough). The job
+#   additionally requires the OCA_REPO_TOKEN secret on kara: a PAT with
+#   Contents:read on the private 0xCarbon/oca repository; the same token
+#   feeds oca's private-go-auth action for private Go module fetches.
+#   Without the secret the job fails fast with instructions.
+#
+# Manual run: workflow_dispatch with input oca_ref (default "main").
+name: kara-regression
+
+"on":
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      oca_ref:
+        description: "oca ref (SHA, branch or tag) for the oca-e2e job"
+        default: "main"
+  repository_dispatch:
+    types:
+      - oca-e2e
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: fork regression unit targets (bazel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Install bazelisk as bazel
+        run: |
+          set -euo pipefail
+          sudo curl -L -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+          bazel --version
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Run fork regression unit targets
+        run: |
+          set -euo pipefail
+          # Waves 01-06 fork-added test surface that bazel can run
+          # unprivileged. The root-required subset lives in container-root.
+          # Note: runsc/cmd re-executes itself through a user namespace at
+          # TestMain (MaybeRunAsRoot); hardened self-hosted runners that
+          # deny exec of /proc/self/exe inside user namespaces will fail
+          # there - that is an environment restriction, not a regression
+          # (reproduces on such hosts at master too).
+          bazel test \
+            //pkg/flipcall:flipcall_layout_test \
+            //pkg/hostifc:hostifc_test \
+            //pkg/lisafs:abi_conformance_test \
+            //pkg/lisafs:fuzz_test \
+            //pkg/tcpip/tests/integration:egress_gate_test \
+            //runsc/boot:egress_gate_test \
+            //runsc/cmd:cmd_test \
+            //runsc/compat:compat_test \
+            //runsc/fsgofer:lisafs_test \
+            //runsc/sandbox:sandbox_test
+
+  container-root:
+    name: container regression (root, ${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - systrap
+          - kvm
+    steps:
+      - name: Check platform availability
+        id: kvm
+        if: matrix.platform == 'kvm'
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "No /dev/kvm on this runner; skipping the kvm leg."
+          fi
+      - name: Install bazelisk as bazel
+        if: steps.kvm.outputs.available != 'false'
+        run: |
+          set -euo pipefail
+          sudo curl -L -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+          bazel --version
+      - name: Checkout
+        if: steps.kvm.outputs.available != 'false'
+        uses: actions/checkout@v5
+      - name: Build and run the root regression subset
+        if: steps.kvm.outputs.available != 'false'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          # The script builds the static runsc + test binaries with bazel,
+          # lays out the _main runfiles shape testutil.ConfigureExePath
+          # needs, and runs the suite as root.
+          tools/kara_regression.sh -p "$PLATFORM"
+
+  oca-e2e:
+    name: oca managed e2e vs fresh kara runsc
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      OCA_REPO: 0xCarbon/oca
+    steps:
+      - name: Resolve oca ref and check secrets
+        id: refs
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.oca_ref }}${{ github.event.client_payload.ref }}"
+          if [ -z "$REF" ]; then REF="main"; fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved oca ref: $REF"
+          if [ -z "${{ secrets.OCA_REPO_TOKEN }}" ]; then
+            echo "::error::OCA_REPO_TOKEN secret is not set on 0xCarbon/kara." \
+              "It must be a PAT with Contents:read on the private 0xCarbon/oca" \
+              "repository (it also feeds oca's private-go-auth action)." >&2
+            exit 1
+          fi
+      - name: Install bazelisk as bazel
+        run: |
+          set -euo pipefail
+          sudo curl -L -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+          bazel --version
+      - name: Checkout kara
+        uses: actions/checkout@v5
+      - name: Build static kara runsc
+        run: |
+          set -euo pipefail
+          bazel build //runsc:runsc
+          mkdir -p bin
+          cp bazel-bin/runsc/runsc_/runsc bin/runsc
+          chmod +x bin/runsc
+          file bin/runsc
+      - name: Checkout oca
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.OCA_REPO }}
+          ref: ${{ steps.refs.outputs.ref }}
+          token: ${{ secrets.OCA_REPO_TOKEN }}
+          path: oca
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: oca/go.mod
+          cache-dependency-path: oca/go.sum
+      - name: Private Go module auth (oca action)
+        uses: ./oca/.github/actions/private-go-auth
+        with:
+          gh-pat: ${{ secrets.OCA_REPO_TOKEN }}
+      - name: Install cgo and runtime dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc libc6-dev libsqlite3-dev iproute2 iptables runc
+      - name: Build rootfs images (busybox + toolchain)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rootfs/busybox /tmp/rootfs/toolchain
+          cid=$(docker create busybox:latest)
+          docker export "$cid" | sudo tar -C /tmp/rootfs/busybox -xf -
+          docker rm "$cid"
+          printf 'FROM alpine:3.20\nRUN apk add --no-cache git python3 py3-pip nodejs npm\n' \
+            | docker build -q -t oca-toolchain:e2e -
+          cid=$(docker create oca-toolchain:e2e)
+          docker export "$cid" | sudo tar -C /tmp/rootfs/toolchain -xf -
+          docker rm "$cid"
+          # The Sentry's create path needs a root-owned rootfs.
+          sudo chown -R root:root /tmp/rootfs
+      - name: Run oca managed e2e suite against the kara runsc
+        working-directory: oca
+        run: |
+          set -euo pipefail
+          go test -c -tags managede2e ./gofer/ -o /tmp/managede2e.test
+          go test -c -tags managede2e ./worker/ -o /tmp/worker-managede2e.test
+          CGO_ENABLED=0 go build -o /tmp/oca-init ./cmd/oca-init
+          sudo env \
+            OCA_RUNSC="$GITHUB_WORKSPACE/bin/runsc" \
+            OCA_ROOTFS=/tmp/rootfs/busybox \
+            OCA_TOOLCHAIN_ROOTFS=/tmp/rootfs/toolchain \
+            OCA_RUNC="$(command -v runc)" \
+            /tmp/managede2e.test \
+            -test.run 'TestManagedBootE2E|TestManagedFSWorkloadE2E|TestManagedExtOpsE2E|TestManagedNetworkLoopbackE2E|TestManagedEgressDenyE2E|TestManagedEgressPolicyMatrixE2E|TestManagedToolchainDifferentialE2E' \
+            -test.v -test.timeout 1200s
+          sudo env \
+            OCA_RUNSC="$GITHUB_WORKSPACE/bin/runsc" \
+            OCA_ROOTFS=/tmp/rootfs/busybox \
+            OCA_INIT_BIN=/tmp/oca-init \
+            /tmp/worker-managede2e.test \
+            -test.run 'TestManagedInitLifecycleE2E|TestManagedSuspendFDDonationProbe|TestManagedPressureSuspendE2E' \
+            -test.v -test.timeout 900s
