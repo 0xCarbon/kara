@@ -1818,7 +1818,8 @@ func testStateAfterInitKilled(t *testing.T, conf *config.Config, restored bool) 
 	if err != nil {
 		t.Fatalf("error creating container: %v", err)
 	}
-	defer func() { cont.Destroy() }()
+	origCont := cont
+	t.Cleanup(func() { origCont.Destroy() })
 	if err := cont.Start(conf); err != nil {
 		t.Fatalf("error starting container: %v", err)
 	}

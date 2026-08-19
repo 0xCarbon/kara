@@ -2182,18 +2182,29 @@ func (s *Sandbox) IsRunning() bool {
 	return !procIsZombie(pid)
 }
 
-// procIsZombie returns true if the process with the given PID is a zombie.
-// It returns false if the process state cannot be determined.
+// procIsZombie returns true if the process with the given PID is a zombie or
+// has already been reaped (in which case it is equally not running). It
+// returns false if the process state cannot be determined.
 func procIsZombie(pid int) bool {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		// Signal 0 has already confirmed that the process exists, so assume
+		if errors.Is(err, os.ErrNotExist) {
+			// The process exited and was reaped between the signal 0 above
+			// and this read; it is definitively not running (nor a zombie).
+			return true
+		}
+		// The process exists but its state cannot be determined; assume
 		// that it is not a zombie.
 		return false
 	}
-	// The process state is the field following the second field (comm),
-	// which is enclosed in parentheses and may itself contain parentheses
-	// and spaces, so search for the last ')'.
+	return statIsZombie(b)
+}
+
+// statIsZombie returns whether a /proc/[pid]/stat buffer describes a zombie.
+// The process state is the field following the second field (comm), which is
+// enclosed in parentheses and may itself contain parentheses and spaces, so
+// search for the last ')'.
+func statIsZombie(b []byte) bool {
 	if i := bytes.LastIndexByte(b, ')'); i >= 0 && i+2 < len(b) {
 		return b[i+2] == 'Z'
 	}

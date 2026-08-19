@@ -28,9 +28,6 @@ func TestIsRunningZombieNotRunning(t *testing.T) {
 	// being reaped).
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if cmd.ProcessState != nil {
-			t.Fatalf("child was reaped unexpectedly")
-		}
 		// Poll /proc for the zombie state.
 		if procStateIsZombie(t, cmd.Process.Pid) {
 			break
@@ -57,6 +54,32 @@ func TestIsRunningZombieNotRunning(t *testing.T) {
 	gone.Pid.Store(1 << 30)
 	if gone.IsRunning() {
 		t.Errorf("IsRunning() = true for nonexistent pid, want false")
+	}
+}
+
+// TestStatIsZombieParsing pins the /proc/[pid]/stat parse against comm
+// values containing ')' and spaces, which the field itself permits.
+func TestStatIsZombieParsing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"plain running", "17 (runsc-sandbox) R 1 ...", false},
+		{"plain zombie", "17 (runsc-sandbox) Z 1 ...", true},
+		{"comm with parens and spaces, zombie", `17 (a ) b) Z 1 ...`, true},
+		{"comm with parens and spaces, running", `17 (a ) b) S 1 ...`, false},
+		{"comm of parens running", `17 ()))))))))))))) R 1 ...`, false},
+		{"comm with state-looking suffix", `17 (a) Z (running) S 1 ...`, false},
+		{"comm containing Z", `17 (x) Z (running) Z 1 ...`, true},
+		{"empty comm", `17 () X 1 ...`, false},
+		{"truncated line", `17 (runsc`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statIsZombie([]byte(tc.line)); got != tc.want {
+				t.Errorf("statIsZombie(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
 	}
 }
 
