@@ -27,6 +27,12 @@ import "golang.org/x/sys/unix"
 // because the peer endpoint is only created by an explicit call to
 // NewEndpoint with the donated descriptor.
 func socketpairSeqPacket() ([2]int, error) {
+	// The non-atomic socketpair + fcntl(FD_CLOEXEC) sequence must be
+	// guarded against a concurrent fork/exec, or the child could inherit
+	// the donation sockets (syscall.ForkLock is the Go runtime's contract
+	// for exactly this pattern).
+	unix.ForkLock.Lock()
+	defer unix.ForkLock.Unlock()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
 		return fds, err

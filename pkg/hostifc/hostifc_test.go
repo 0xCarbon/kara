@@ -154,8 +154,11 @@ func TestDefaultIPCWindowAllocator(t *testing.T) {
 	if d1.Offset == d2.Offset {
 		t.Fatalf("windows overlap at %d", d1.Offset)
 	}
-	if d1.Length != 4096 || d2.Length != 4096 {
-		t.Fatalf("window lengths %d, %d; wanted 4096", d1.Length, d2.Length)
+	// Allocate rounds up to the host page size; on 64 KiB-page hosts
+	// (ARM64), a 4096-byte request legitimately yields a 65536-byte window.
+	wantLen := int(unix.Getpagesize())
+	if d1.Length != wantLen || d2.Length != wantLen {
+		t.Fatalf("window lengths %d, %d; wanted page-size %d", d1.Length, d2.Length, wantLen)
 	}
 	_ = flipcall.PacketHeaderBytes // keep the flipcall ABI dependency visible
 }
