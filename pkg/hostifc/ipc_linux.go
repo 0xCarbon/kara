@@ -42,7 +42,7 @@ func (defaultIPC) ControlSocketFromFD(fd int) (ControlSocket, error) {
 
 // NewControlSocketPair implements IPC.NewControlSocketPair.
 func (defaultIPC) NewControlSocketPair() (ControlSocket, ControlSocket, error) {
-	a, b, err := unet.SocketPair(false /* stream */)
+	a, b, err := unet.SocketPair(false /* packet */)
 	if err != nil {
 		return nil, nil, err
 	}

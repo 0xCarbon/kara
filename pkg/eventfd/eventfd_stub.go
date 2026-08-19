@@ -99,8 +99,8 @@ type MMIOController interface {
 	Close(ev Eventfd)
 }
 
-// EnableMMIO implements Eventfd.EnableMMIO. It records the request but no
-// MMIO write path exists on non-Linux hosts.
+// EnableMMIO implements Eventfd.EnableMMIO. No MMIO write path exists on
+// non-Linux hosts; the request is discarded (kept for API parity).
 func (ev *Eventfd) EnableMMIO(addr uintptr, ctrl MMIOController) {
 	_ = addr
 	_ = ctrl

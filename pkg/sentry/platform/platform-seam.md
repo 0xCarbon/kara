@@ -167,3 +167,23 @@ Linux invariant: all affected bazel targets stay green (fd, fdchannel,
 eventfd, seccomp, hostifc, flipcall, lisafs suite, platform interrupt);
 implementations were moved, not modified, except the documented single-token
 indirections (`fd.Open` flag const, `fdchannel` socketpair helper).
+
+
+## Proof methodology notes (review findings)
+
+- The darwin build proofs were run as plain `go build` on the //:gopath
+  archive with the wave-05 diff overlaid (the library compiles; in-package
+  tests on darwin are future work). Under `bazel build
+  --platforms=@io_bazel_rules_go//go/toolchain:darwin_arm64`, all seam
+  packages EXCEPT `//pkg/hostifc` also cross-compile green; `pkg/hostifc`
+  depends on `//pkg/unet` unconditionally in its BUILD file, and
+  `pkg/unet/unet_unsafe.go` does not compile on darwin (Cmsghdr/Iovec
+  width mismatches). Wave-06 must either tag-split the unet dep or route
+  through a build-tag-selected adapter before bazel-darwin CI can include
+  `pkg/hostifc`.
+- The socketpair stub keeps SOCK_SEQPACKET for compile shape; macOS AF_UNIX
+  does not implement SOCK_SEQPACKET (XNU uipc supports STREAM/DGRAM only),
+  so a darwin backend must substitute SOCK_DGRAM at the ipc adapter layer.
+- `platforms.go` uses the build tag `linux && !debug` (not bare `linux`).
+- SEAM.md's injection point is item 4 of the "What a wave-05 backend must
+  provide" list (the document has no numbered sections).

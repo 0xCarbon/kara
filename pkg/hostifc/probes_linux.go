@@ -17,7 +17,12 @@
 
 package hostifc
 
-// probeControlPlane implements ProbeControlPlane for Linux hosts.
+// probeControlPlane implements ProbeControlPlane for Linux hosts. All
+// capabilities are reported unconditionally true here: the sentry's Linux
+// build path requires them, and runtime probing is done by the individual
+// packages (e.g. hostmm.Probe for membarrier) at the point of use. Callers
+// needing a runtime membarrier check should consult hostmm.Probe directly
+// rather than this coarse-grained probe.
 func probeControlPlane() ControlPlane {
 	return ControlPlane{
 		SeccompFilters: true,
