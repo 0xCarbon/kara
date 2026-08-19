@@ -9,11 +9,15 @@ package(
 go_library(
     name = "testsuite",
     testonly = True,
-    srcs = ["testsuite.go"],
+    srcs = [
+        "testsuite.go",
+        "wire_conformance.go",
+    ],
     deps = [
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/lisafs",
+        "//pkg/lisafs/testsupport",
         "//pkg/rand",
         "//pkg/refs",
         "//pkg/unet",

@@ -61,3 +61,9 @@ func (tester) BindSupported() bool {
 func TestFSGofer(t *testing.T) {
 	testsuite.RunAllLocalFSTests(t, tester{})
 }
+
+// TestWireConformance replays the committed golden request corpus against a
+// live fsgofer server through an independent wire codec (testsuite).
+func TestWireConformance(t *testing.T) {
+	testsuite.RunWireConformanceTest(t, tester{})
+}

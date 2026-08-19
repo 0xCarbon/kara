@@ -192,6 +192,20 @@ go_test(
     ],
 )
 
+
+go_test(
+    name = "fuzz_test",
+    size = "medium",
+    srcs = ["fuzz_test.go"],
+    data = [":golden_corpus"],
+    library = ":lisafs",
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/lisafs/testsupport",
+        "//pkg/unet",
+    ],
+)
+
 # plain_go_import_test proves that the plain-Go external-consumer surface
 # (pkg/lisafs, pkg/flipcall, pkg/fdchannel via the synthetic `go` branch
 # archive) builds and vets outside the repository. See the script header for
