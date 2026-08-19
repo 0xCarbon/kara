@@ -211,6 +211,11 @@ type Args struct {
 	// mounts (root first, then spec mounts). Only valid for the root
 	// container of a new sandbox.
 	IOFDs []int
+
+	// EgressFD is the optional AF_UNIX FD to the Oca egress flow gate. A nil
+	// pointer disables the data path; an explicit descriptor 0 remains valid.
+	// Re-donated to the sandbox (Oca #447).
+	EgressFD *int
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -403,6 +408,10 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 
 		// Start a new sandbox for this container. Any errors after this point
 		// must destroy the container.
+		var egressFile *os.File
+		if args.EgressFD != nil {
+			egressFile = os.NewFile(uintptr(*args.EgressFD), "oca-egress-fd")
+		}
 		sandArgs := &sandbox.Args{
 			ID:                  sandboxID,
 			Spec:                args.Spec,
@@ -410,6 +419,7 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			ConsoleSocket:       args.ConsoleSocket,
 			UserLog:             args.UserLog,
 			IOFiles:             ioFiles,
+			EgressFile:          egressFile,
 			DevIOFile:           devIOFile,
 			MountsFile:          specFile,
 			Cgroup:              containerCgroup,

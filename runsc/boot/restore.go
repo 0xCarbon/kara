@@ -37,12 +37,14 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/timing"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/pprof"
@@ -492,8 +494,23 @@ func (r *restorer) restore(l *Loader) error {
 		r.timer.Reached("rootfs upper layer extracted")
 		return nil
 	}
+	// Re-inject the live egress gate into the restored kernel: the saved
+	// Stack's gate is state:"nosave" (its socket cannot cross a checkpoint),
+	// so without this the restored stack would silently run ungated even
+	// though restore donated --egress-fd.
+	if l.egressGate != nil {
+		ctx = context.WithValue(ctx, stack.CtxEgressGate{}, stack.EgressGate(l.egressGate))
+	}
 	if err := l.k.LoadFrom(ctx, r.stateFile, r.asyncMFLoader, nil, l, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}, r.timer.Fork("kernel load")); err != nil {
 		return fmt.Errorf("failed to load kernel: %w", err)
+	}
+	// Fail closed: a checkpoint taken with an egress gate must not come
+	// back up ungated (Stack.egressGated survives the state file; the gate
+	// itself does not).
+	if ns := l.k.RootNetworkNamespace(); ns != nil && l.egressGate == nil {
+		if st, ok := ns.Stack().(*netstack.Stack); ok && st.Stack.EgressGated() {
+			return fmt.Errorf("checkpoint was created with an egress gate; restore must donate --egress-fd")
+		}
 	}
 	r.timer.Reached("kernel loaded")
 	if oldNvidiaDriverVersion.Major() > 0 && !l.k.NvidiaDriverVersion.Equals(oldNvidiaDriverVersion) {

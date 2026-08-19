@@ -414,6 +414,14 @@ func (e *endpoint) prepareForWrite(p tcpip.Payloader, opts tcpip.WriteOptions) (
 		return udpPacketInfo{}, &tcpip.ErrDestinationRequired{}
 	}
 
+	// Oca egress gate (#447): gate every outbound datagram — including
+	// unconnected sendto, which is how DNS/53 leaves — before it is sent.
+	if g := e.stack.EgressGate(); g != nil {
+		if gerr := g.CheckUDP(dst); gerr != nil {
+			return udpPacketInfo{}, gerr
+		}
+	}
+
 	ctx, err := e.net.AcquireContextForWrite(opts)
 	if err != nil {
 		return udpPacketInfo{}, err

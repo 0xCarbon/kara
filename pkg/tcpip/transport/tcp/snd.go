@@ -1006,6 +1006,9 @@ var zeroProbeJunk = []byte{0}
 
 // +checklocks:s.ep.mu
 func (s *sender) sendZeroWindowProbe() {
+	if s.ep.egressL7Hold {
+		return
+	}
 	s.unackZeroWindowProbes++
 
 	// Send a zero window probe with sequence number pointing to the last
@@ -1080,6 +1083,9 @@ func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
 // when the send window opens up.
 // +checklocks:s.ep.mu
 func (s *sender) sendData() {
+	if s.ep.egressL7Hold {
+		return
+	}
 	limit := s.MaxPayloadSize
 	if s.gso {
 		limit = int(s.ep.gso.MaxSize - header.TCPTotalHeaderMaximumSize - 1)

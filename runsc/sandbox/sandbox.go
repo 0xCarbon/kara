@@ -275,6 +275,10 @@ type Args struct {
 	// same order as mounts appear in the spec.
 	IOFiles []*os.File
 
+	// EgressFile is the AF_UNIX FD to the Oca egress flow gate, donated to
+	// the sandbox as --egress-fd (Oca #447). Nil when disabled.
+	EgressFile *os.File
+
 	// File that connects to a gofer endpoint for a device mount point at /dev.
 	DevIOFile *os.File
 
@@ -1016,6 +1020,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyn
 
 	// If there is a gofer, sends all socket ends to the sandbox.
 	donations.DonateAndClose("io-fds", args.IOFiles...)
+	if args.EgressFile != nil {
+		donations.DonateAndClose("egress-fd", args.EgressFile)
+	}
 	donations.DonateAndClose("dev-io-fd", args.DevIOFile)
 	donations.DonateAndClose("gofer-filestore-fds", args.GoferFilestoreFiles...)
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
