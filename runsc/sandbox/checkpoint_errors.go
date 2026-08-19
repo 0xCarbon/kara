@@ -125,7 +125,14 @@ func classifyCheckpointError(err error) error {
 	if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) ||
 		strings.HasSuffix(msg, "failed: EOF") || strings.HasSuffix(msg, "failed: connection reset by peer") ||
 		// Connect-time death: the sandbox exited before sandboxConnect ran.
+		// The dial itself fails: connError's "connecting to control
+		// server at PID %d: %v" (ECONNREFUSED once the killed listener's
+		// socket is gone), a missing control-socket path, or an
+		// unopenable socket file. The shapes are pinned to the producers
+		// in the tests so they cannot drift.
 		strings.Contains(msg, "no control socket found") ||
+		strings.Contains(msg, "connecting to control server") ||
+		strings.Contains(msg, "failed to open socket at") ||
 		strings.Contains(msg, "connecting to sandbox") {
 		return &SandboxDeath{Err: err}
 	}
