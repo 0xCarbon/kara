@@ -1389,6 +1389,318 @@ func TestCheckpointRestore(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreSignalHandlerRead mirrors the user scenario reported
+// in gvisor#14139: after checkpoint/restore, a signal is delivered to the
+// restored container and its handler performs a read on a file descriptor
+// that was opened before the checkpoint.
+//
+// The original report used busybox 1.38.0, whose `read` builtin spins
+// forever inside any trap handler, even on plain Linux without gVisor:
+// onsig() sets bb_got_signal, dotrap() clears only pending_sig, and
+// shell_builtin_read() then keeps returning EINTR without ever polling,
+// which readcmd() retries in a tight userspace loop (busybox regression
+// between 1.37.0 and 1.38.0; fix: clear bb_got_signal in dotrap). This test
+// therefore uses bash, which handles read-in-trap correctly, and verifies
+// the gVisor properties the report is actually about: signal delivery to a
+// restored task, the handler's dup2 redirections, and the blocking read on
+// a gofer-backed file all complete, and the main loop keeps running.
+func TestCheckpointRestoreSignalHandlerRead(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("special configuration required for checkpoint/restore")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			testCheckpointRestoreSignalHandlerRead(t, conf)
+		})
+	}
+}
+
+func testCheckpointRestoreSignalHandlerRead(t *testing.T, conf *config.Config) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-signal-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	streamPath := filepath.Join(dir, "stream")
+	if err := os.WriteFile(streamPath, []byte("alpha\nbeta\n"), 0666); err != nil {
+		t.Fatalf("error creating stream file: %v", err)
+	}
+	proofFile, err := createWriteableOutputFile(filepath.Join(dir, "proof"))
+	if err != nil {
+		t.Fatalf("error creating proof file: %v", err)
+	}
+	defer proofFile.Close()
+	trapFile, err := createWriteableOutputFile(filepath.Join(dir, "trap"))
+	if err != nil {
+		t.Fatalf("error creating trap file: %v", err)
+	}
+	defer trapFile.Close()
+	ticksFile, err := createWriteableOutputFile(filepath.Join(dir, "ticks"))
+	if err != nil {
+		t.Fatalf("error creating ticks file: %v", err)
+	}
+	defer ticksFile.Close()
+
+	script := fmt.Sprintf(`
+set -eu
+exec 3< %q
+IFS= read -r first <&3
+trap 'echo trap > %q; IFS= read -r second <&3; echo proof:$first:$second > %q' USR1
+while :; do echo tick >> %q; sleep 1; done
+`, streamPath, trapFile.Name(), proofFile.Name(), ticksFile.Name())
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+
+	// Wait until the application is running.
+	if err := waitForFileNotEmpty(ticksFile); err != nil {
+		t.Fatalf("failed to wait for ticks file: %v", err)
+	}
+
+	// Checkpoint, destroy, and restore under a new ID.
+	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	lastTicks, err := countLines(ticksFile.Name())
+	if err != nil {
+		t.Fatalf("error with ticks file: %v", err)
+	}
+	cont.Destroy()
+	cont = nil
+
+	args2 := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont2, err := New(conf, args2)
+	if err != nil {
+		t.Fatalf("error creating restored container: %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+
+	// Wait for the restored loop to make progress.
+	if err := testutil.Poll(func() error {
+		n, err := countLines(ticksFile.Name())
+		if err != nil {
+			return err
+		}
+		if n <= lastTicks {
+			return fmt.Errorf("restored container has not resumed: ticks=%d, want > %d", n, lastTicks)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Fatalf("restored container did not resume: %v", err)
+	}
+
+	// Deliver the signal whose handler performs the blocking read. The
+	// handler must complete and the main loop must keep ticking.
+	if err := cont2.SignalContainer(unix.SIGUSR1, false); err != nil {
+		t.Fatalf("error sending SIGUSR1: %v", err)
+	}
+	if err := waitForFileNotEmpty(proofFile); err != nil {
+		t.Fatalf("signal handler did not complete (read in trap): %v", err)
+	}
+	proof, err := os.ReadFile(proofFile.Name())
+	if err != nil {
+		t.Fatalf("error reading proof file: %v", err)
+	}
+	if want := "proof:alpha:beta\n"; string(proof) != want {
+		t.Errorf("proof file = %q, want %q", proof, want)
+	}
+	if err := testutil.Poll(func() error {
+		n, err := countLines(ticksFile.Name())
+		if err != nil {
+			return err
+		}
+		if n <= lastTicks+3 {
+			return fmt.Errorf("main loop stalled after signal handler: ticks=%d", n)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Errorf("main loop did not continue after signal handler: %v", err)
+	}
+	cont2.Destroy()
+}
+
+// TestCheckpointRestoreLongSleep verifies that a sleep deadline that is
+// pending across a checkpoint/restore still fires after the restore, even
+// if nothing else in the container requests time in between (a silent
+// window). This guards the restore path of sampled clocks and timers.
+func TestCheckpointRestoreLongSleep(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("special configuration required for checkpoint/restore")
+	}
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			testCheckpointRestoreLongSleep(t, conf)
+		})
+	}
+}
+
+func testCheckpointRestoreLongSleep(t *testing.T, conf *config.Config) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-longsleep-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+
+	outputFile, err := createWriteableOutputFile(filepath.Join(dir, "output"))
+	if err != nil {
+		t.Fatalf("error creating output file: %v", err)
+	}
+	defer outputFile.Close()
+
+	// The sleep deadline must fire long after the restore, while the
+	// container is otherwise silent.
+	script := fmt.Sprintf("echo start >> %q; sleep 15; echo done >> %q", outputFile.Name(), outputFile.Name())
+	spec := testutil.NewSpecWithArgs("bash", "-c", script)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForFileNotEmpty(outputFile); err != nil {
+		t.Fatalf("failed to wait for output file: %v", err)
+	}
+
+	// Checkpoint while the sleep is pending, then restore.
+	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	cont.Destroy()
+	cont = nil
+
+	args2 := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont2, err := New(conf, args2)
+	if err != nil {
+		t.Fatalf("error creating restored container: %v", err)
+	}
+	defer cont2.Destroy()
+	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+
+	// Give the restored container a silent window, then require the sleep
+	// deadline to have fired.
+	time.Sleep(5 * time.Second)
+	if err := testutil.Poll(func() error {
+		got, err := os.ReadFile(outputFile.Name())
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(got), "done") {
+			return fmt.Errorf("sleep deadline pending before restore has not fired yet: %q", got)
+		}
+		return nil
+	}, pollTimeout); err != nil {
+		t.Errorf("long sleep did not complete after restore: %v", err)
+	}
+	cont2.Destroy()
+}
+
+// TestSignalUserspaceSpinTask verifies that a task that spins in userspace
+// without issuing any syscalls is still interruptible: signals must be
+// delivered and the container must stop within a bounded time. This guards
+// the platform interrupt paths (e.g. systrap NotifyInterrupt) that runsc
+// relies on to preempt syscall-free tasks.
+func TestSignalUserspaceSpinTask(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			spec := testutil.NewSpecWithArgs("bash", "-c", "while :; do :; done")
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			cont, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			// Let the task spin syscall-free for a while, then kill it.
+			time.Sleep(5 * time.Second)
+			if err := cont.SignalContainer(unix.SIGKILL, false); err != nil {
+				t.Fatalf("error sending SIGKILL: %v", err)
+			}
+			done := make(chan struct{})
+			go func() {
+				cont.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(pollTimeout):
+				t.Fatalf("container with userspace-spinning task did not stop within %v", pollTimeout)
+			}
+		})
+	}
+}
+
+// countLines returns the number of lines in the file at path.
+func countLines(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strings.Count(string(b), "\n"), nil
+}
+
 // TestCheckpointRestoreHostname verifies that hostname is updated on restore
 // if it was not changed inside the container, and is NOT updated if it was changed.
 func TestCheckpointRestoreHostname(t *testing.T) {
