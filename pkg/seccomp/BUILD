@@ -14,6 +14,7 @@ go_library(
         "seccomp_fuzz_helpers.go",
         "seccomp_optimizer.go",
         "seccomp_rules.go",
+        "seccomp_stub.go",
         "seccomp_unsafe.go",
     ],
     visibility = ["//:sandbox"],
