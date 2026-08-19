@@ -16,6 +16,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2171,8 +2172,32 @@ func (s *Sandbox) IsRunning() bool {
 		return false
 	}
 	// Send a signal 0 to the sandbox process. If it succeeds, the sandbox
-	// process is running.
-	return unix.Kill(pid, 0) == nil
+	// process exists.
+	if unix.Kill(pid, 0) != nil {
+		return false
+	}
+	// Signal 0 also succeeds on zombie processes. If the sandbox exited but
+	// nobody reaped it (e.g. it was started detached and its parent is gone),
+	// it remains a zombie forever, so it must not be reported as running.
+	return !procIsZombie(pid)
+}
+
+// procIsZombie returns true if the process with the given PID is a zombie.
+// It returns false if the process state cannot be determined.
+func procIsZombie(pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		// Signal 0 has already confirmed that the process exists, so assume
+		// that it is not a zombie.
+		return false
+	}
+	// The process state is the field following the second field (comm),
+	// which is enclosed in parentheses and may itself contain parentheses
+	// and spaces, so search for the last ')'.
+	if i := bytes.LastIndexByte(b, ')'); i >= 0 && i+2 < len(b) {
+		return b[i+2] == 'Z'
+	}
+	return false
 }
 
 // Stacks collects and returns all stacks for the sandbox.
