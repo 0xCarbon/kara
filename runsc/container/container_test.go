@@ -53,6 +53,7 @@ import (
 	"gvisor.dev/gvisor/pkg/state/statefile"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
@@ -2294,6 +2295,136 @@ func TestCheckpointRestoreHostname(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPortForwardDialProbe exercises the minimum host-to-sandbox dial
+// surface used for health probes without exec-in-sandbox (wave-04):
+// Container.PortForward donates one file descriptor and the sandbox splices
+// it to the (container, port) target. With host networking the target is
+// 127.0.0.1:port, so the test itself can be the listener and prove the dial
+// carries data in both directions.
+func TestPortForwardDialProbe(t *testing.T) {
+	for name, conf := range configs(t, true /* noOverlay */) {
+		conf.Network = config.NetworkHost
+		t.Run(name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("net.Listen: %v", err)
+			}
+			defer ln.Close()
+			port := ln.Addr().(*net.TCPAddr).Port
+
+			spec := testutil.NewSpecWithArgs("sleep", "1000")
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			cont, err := New(conf, Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			})
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer cont.Destroy()
+			if err := cont.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			// The probe endpoint: one end of a socketpair is donated to the
+			// sandbox; the test keeps the other.
+			probeClient, probeServer, err := socketpair()
+			if err != nil {
+				t.Fatalf("socketpair: %v", err)
+			}
+			defer probeClient.Close()
+
+			done := make(chan error, 1)
+			go func() {
+				done <- cont.PortForward(&boot.PortForwardOpts{
+					Port: uint16(port),
+					FilePayload: urpc.FilePayload{
+						Files: []*os.File{probeServer},
+					},
+				})
+			}()
+
+			// The dial must reach the listener; data written on the probe end
+			// must arrive there, and a reply must come back.
+			type result struct {
+				conn net.Conn
+				err  error
+			}
+			accepted := make(chan result, 1)
+			go func() {
+				conn, err := ln.Accept()
+				accepted <- result{conn, err}
+			}()
+
+			const probeMsg = "probe-dial"
+			if _, err := probeClient.Write([]byte(probeMsg)); err != nil {
+				t.Fatalf("writing probe message: %v", err)
+			}
+			var conn net.Conn
+			select {
+			case r := <-accepted:
+				if r.err != nil {
+					t.Fatalf("Accept: %v", r.err)
+				}
+				conn = r.conn
+			case <-time.After(pollTimeout):
+				t.Fatalf("port-forward dial never reached the listener")
+			}
+			defer conn.Close()
+
+			buf := make([]byte, len(probeMsg))
+			_ = conn.SetReadDeadline(time.Now().Add(pollTimeout))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				t.Fatalf("reading probe message at the listener: %v", err)
+			}
+			if string(buf) != probeMsg {
+				t.Errorf("listener got %q, want %q", string(buf), probeMsg)
+			}
+			const replyMsg = "probe-ack"
+			if _, err := conn.Write([]byte(replyMsg)); err != nil {
+				t.Fatalf("writing reply: %v", err)
+			}
+			reply := make([]byte, len(replyMsg))
+			_ = probeClient.SetReadDeadline(time.Now().Add(pollTimeout))
+			if _, err := io.ReadFull(probeClient, reply); err != nil {
+				t.Fatalf("reading reply on the probe end: %v", err)
+			}
+			if string(reply) != replyMsg {
+				t.Errorf("probe got %q, want %q", string(reply), replyMsg)
+			}
+			// PortForward blocks for the lifetime of the forwarded
+			// connection; closing both ends lets it return.
+			conn.Close()
+			probeClient.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("PortForward returned error: %v", err)
+				}
+			case <-time.After(pollTimeout):
+				t.Errorf("PortForward did not return after the connection closed")
+			}
+		})
+	}
+}
+
+// socketpair returns the two ends of a connected AF_UNIX SOCK_STREAM pair.
+func socketpair() (*os.File, *os.File, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	a := os.NewFile(uintptr(fds[0]), "probe-a")
+	b := os.NewFile(uintptr(fds[1]), "probe-b")
+	return a, b, nil
 }
 
 // TestCheckpointRestoreHostinet does the checkpoint/restore test with host

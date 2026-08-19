@@ -217,6 +217,12 @@ type Args struct {
 	// own gofer process; these FDs map 1:1, in order, to the gofer-backed
 	// mounts (root first, then spec mounts). Only valid for the root
 	// container of a new sandbox.
+	//
+	// Externally-served mounts do not need the global --directfs=false /
+	// --overlay2=none skew: annotate the served mounts with
+	// dev.gvisor.spec.mount.<name>.directfs=off (the per-mount no-host-FD
+	// capability, see boot.MountHint.SuppressDirectFS) and keep their overlay
+	// at "none" or "memory" (self/anon filestores need runsc's local gofer).
 	IOFDs []int
 
 	// EgressFD is the optional AF_UNIX FD to the Oca egress flow gate. A nil
@@ -682,6 +688,14 @@ func (c *Container) Event() (*boot.EventOut, error) {
 }
 
 // PortForward starts port forwarding to the container.
+// PortForward connects a donated file descriptor to the given port inside
+// the container's network namespace (wave-04 contract for embedders): the
+// donated fd becomes a bidirectional stream to (container, port), which is
+// the minimum host-to-sandbox dial surface for health probes that must not
+// exec inside the sandbox. opts.FilePayload must contain exactly one fd
+// (e.g. one end of a socketpair); PortForward blocks for the lifetime of
+// the forwarded connection. With host networking the dial targets
+// 127.0.0.1:port. The `runsc port-forward` CLI wraps the same RPC.
 func (c *Container) PortForward(opts *boot.PortForwardOpts) error {
 	if err := c.requireStatus("port forward", Running); err != nil {
 		return err
