@@ -6,26 +6,32 @@ package(
 )
 
 go_library(
-    name = "fd",
+    name = "hostifc",
     srcs = [
-        "fd.go",
-        "open_linux.go",
-        "open_stub.go",
+        "hostifc.go",
+        "ipc_linux.go",
+        "ipc_stub.go",
+        "probes.go",
+        "probes_linux.go",
+        "probes_stub.go",
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//pkg/atomicbitops",
+        "//pkg/fdchannel",
+        "//pkg/flipcall",
+        "//pkg/unet",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
 go_test(
-    name = "fd_test",
+    name = "hostifc_test",
     size = "small",
-    srcs = ["fd_test.go"],
-    library = ":fd",
+    srcs = ["hostifc_test.go"],
+    library = ":hostifc",
     deps = [
-        "//pkg/atomicbitops",
+        "//pkg/fdchannel",
+        "//pkg/flipcall",
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )

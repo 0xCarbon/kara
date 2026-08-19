@@ -9,6 +9,7 @@ go_library(
     name = "eventfd",
     srcs = [
         "eventfd.go",
+        "eventfd_stub.go",
         "eventfd_unsafe.go",
     ],
     visibility = [

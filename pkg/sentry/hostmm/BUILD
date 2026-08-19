@@ -11,6 +11,8 @@ go_library(
         "cgroup.go",
         "hostmm.go",
         "membarrier.go",
+        "membarrier_linux.go",
+        "membarrier_stub.go",
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
