@@ -447,6 +447,15 @@ func readOutputNum(file string, position int) (int, error) {
 	return num, nil
 }
 
+// countLines returns the number of lines in the file at path.
+func countLines(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strings.Count(string(b), "\n"), nil
+}
+
 // run starts the sandbox and waits for it to exit, checking that the
 // application succeeded.
 func run(spec *specs.Spec, conf *config.Config) error {
@@ -1402,11 +1411,13 @@ func TestCheckpointRestore(t *testing.T) {
 // between 1.37.0 and 1.38.0; fix: clear bb_got_signal in dotrap). This test
 // therefore uses bash, which handles read-in-trap correctly, and verifies
 // the gVisor properties the report is actually about: signal delivery to a
-// restored task, the handler's dup2 redirections, and the blocking read on
-// a gofer-backed file all complete, and the main loop keeps running.
+// restored task, the handler's redirections, and the read on the pre-opened
+// gofer-backed fd all complete, and the main loop keeps running. (The read
+// has data pre-seeded, so this verifies post-restore fd state and delivery,
+// not blocking semantics.)
 func TestCheckpointRestoreSignalHandlerRead(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
-		t.Skip("special configuration required for checkpoint/restore")
+		t.Skip("Checkpoint not supported")
 	}
 	for name, conf := range configs(t, true /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
@@ -1478,30 +1489,22 @@ while :; do echo tick >> %q; sleep 1; done
 		t.Fatalf("failed to wait for ticks file: %v", err)
 	}
 
-	// Checkpoint, destroy, and restore under a new ID.
+	// Checkpoint while the loop is running, destroy, and restore under a
+	// new ID.
 	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
 		t.Fatalf("error checkpointing container: %v", err)
 	}
+	cont.Destroy()
+	cont = nil
+	// Sample the baseline after Destroy: the original container keeps
+	// ticking until then, and ticks written after an earlier sample would
+	// falsely count as restored-container progress.
 	lastTicks, err := countLines(ticksFile.Name())
 	if err != nil {
 		t.Fatalf("error with ticks file: %v", err)
 	}
-	cont.Destroy()
-	cont = nil
 
-	args2 := Args{
-		ID:        testutil.RandomContainerID(),
-		Spec:      spec,
-		BundleDir: bundleDir,
-	}
-	cont2, err := New(conf, args2)
-	if err != nil {
-		t.Fatalf("error creating restored container: %v", err)
-	}
-	defer cont2.Destroy()
-	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
-		t.Fatalf("error restoring container: %v", err)
-	}
+	cont2 := restoreIntoNewContainer(t, conf, spec, bundleDir, dir)
 
 	// Wait for the restored loop to make progress.
 	if err := testutil.Poll(func() error {
@@ -1517,13 +1520,16 @@ while :; do echo tick >> %q; sleep 1; done
 		t.Fatalf("restored container did not resume: %v", err)
 	}
 
-	// Deliver the signal whose handler performs the blocking read. The
-	// handler must complete and the main loop must keep ticking.
+	// Deliver the signal whose handler performs the read. The handler must
+	// complete and the main loop must keep ticking. Distinguish "handler
+	// entered but blocked in its read" (trap file non-empty, proof empty)
+	// from "signal never delivered" (both empty).
 	if err := cont2.SignalContainer(unix.SIGUSR1, false); err != nil {
 		t.Fatalf("error sending SIGUSR1: %v", err)
 	}
 	if err := waitForFileNotEmpty(proofFile); err != nil {
-		t.Fatalf("signal handler did not complete (read in trap): %v", err)
+		trapContent, _ := os.ReadFile(trapFile.Name())
+		t.Fatalf("signal handler did not complete (read in trap): %v; trap file content (empty = signal never delivered/handler never entered): %q", err, trapContent)
 	}
 	proof, err := os.ReadFile(proofFile.Name())
 	if err != nil {
@@ -1547,13 +1553,34 @@ while :; do echo tick >> %q; sleep 1; done
 	cont2.Destroy()
 }
 
+// restoreIntoNewContainer restores the checkpoint image in dir into a new
+// container with a fresh ID and the original spec, and registers its
+// destruction with t. The caller must have destroyed the original container.
+func restoreIntoNewContainer(t *testing.T, conf *config.Config, spec *specs.Spec, bundleDir, dir string) *Container {
+	t.Helper()
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating restored container: %v", err)
+	}
+	t.Cleanup(func() { cont.Destroy() })
+	if err := cont.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+	return cont
+}
+
 // TestCheckpointRestoreLongSleep verifies that a sleep deadline that is
 // pending across a checkpoint/restore still fires after the restore, even
 // if nothing else in the container requests time in between (a silent
-// window). This guards the restore path of sampled clocks and timers.
+// window). This guards that a pending deadline is not lost across restore.
 func TestCheckpointRestoreLongSleep(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
-		t.Skip("special configuration required for checkpoint/restore")
+		t.Skip("Checkpoint not supported")
 	}
 	for name, conf := range configs(t, true /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
@@ -1605,6 +1632,12 @@ func testCheckpointRestoreLongSleep(t *testing.T, conf *config.Config) {
 		t.Fatalf("failed to wait for output file: %v", err)
 	}
 
+	// The sleep deadline must still be pending at checkpoint time; a slow
+	// runner that lets it expire first would silently turn the test into a
+	// no-op, so fail loudly instead.
+	if got, err := os.ReadFile(outputFile.Name()); err != nil || strings.Contains(string(got), "done") {
+		t.Fatalf("sleep already completed before checkpoint (machine too slow); output=%q err=%v", got, err)
+	}
 	// Checkpoint while the sleep is pending, then restore.
 	if err := cont.Checkpoint(conf, dir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelNone}); err != nil {
 		t.Fatalf("error checkpointing container: %v", err)
@@ -1612,19 +1645,7 @@ func testCheckpointRestoreLongSleep(t *testing.T, conf *config.Config) {
 	cont.Destroy()
 	cont = nil
 
-	args2 := Args{
-		ID:        testutil.RandomContainerID(),
-		Spec:      spec,
-		BundleDir: bundleDir,
-	}
-	cont2, err := New(conf, args2)
-	if err != nil {
-		t.Fatalf("error creating restored container: %v", err)
-	}
-	defer cont2.Destroy()
-	if err := cont2.Restore(conf, dir, false /* direct */, false /* background */, false /* splitFSRestore */, nil /* networkArgs */); err != nil {
-		t.Fatalf("error restoring container: %v", err)
-	}
+	cont2 := restoreIntoNewContainer(t, conf, spec, bundleDir, dir)
 
 	// Give the restored container a silent window, then require the sleep
 	// deadline to have fired.
@@ -1645,14 +1666,30 @@ func testCheckpointRestoreLongSleep(t *testing.T, conf *config.Config) {
 }
 
 // TestSignalUserspaceSpinTask verifies that a task that spins in userspace
-// without issuing any syscalls is still interruptible: signals must be
+// without issuing any syscalls is still interruptible: SIGKILL must be
 // delivered and the container must stop within a bounded time. This guards
 // the platform interrupt paths (e.g. systrap NotifyInterrupt) that runsc
 // relies on to preempt syscall-free tasks.
 func TestSignalUserspaceSpinTask(t *testing.T) {
 	for name, conf := range configs(t, true /* noOverlay */) {
 		t.Run(name, func(t *testing.T) {
-			spec := testutil.NewSpecWithArgs("bash", "-c", "while :; do :; done")
+			// Skip overlay because the test requires writing to host file.
+			dir, err := os.MkdirTemp(testutil.TmpDir(), "spin-test")
+			if err != nil {
+				t.Fatalf("os.MkdirTemp failed: %v", err)
+			}
+			defer os.RemoveAll(dir)
+			if err := os.Chmod(dir, 0777); err != nil {
+				t.Fatalf("error chmoding file: %q, %v", dir, err)
+			}
+			startFile, err := createWriteableOutputFile(filepath.Join(dir, "started"))
+			if err != nil {
+				t.Fatalf("error creating start file: %v", err)
+			}
+			defer startFile.Close()
+
+			script := fmt.Sprintf("echo started > %q; while :; do :; done", startFile.Name())
+			spec := testutil.NewSpecWithArgs("bash", "-c", script)
 			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 			if err != nil {
 				t.Fatalf("error setting up container: %v", err)
@@ -1673,32 +1710,37 @@ func TestSignalUserspaceSpinTask(t *testing.T) {
 				t.Fatalf("error starting container: %v", err)
 			}
 
-			// Let the task spin syscall-free for a while, then kill it.
-			time.Sleep(5 * time.Second)
+			// Wait until the task is actually spinning, then kill it. The
+			// task must die from SIGKILL (not from a crash), so capture the
+			// wait status.
+			if err := waitForFileNotEmpty(startFile); err != nil {
+				t.Fatalf("failed to wait for spin task to start: %v", err)
+			}
 			if err := cont.SignalContainer(unix.SIGKILL, false); err != nil {
 				t.Fatalf("error sending SIGKILL: %v", err)
 			}
-			done := make(chan struct{})
+			type waitResult struct {
+				ws  unix.WaitStatus
+				err error
+			}
+			resCh := make(chan waitResult, 1)
 			go func() {
-				cont.Wait()
-				close(done)
+				ws, err := cont.Wait()
+				resCh <- waitResult{ws, err}
 			}()
 			select {
-			case <-done:
+			case res := <-resCh:
+				if res.err != nil {
+					t.Errorf("container.Wait() = %v, want nil", res.err)
+				} else if !res.ws.Signaled() || res.ws.Signal() != unix.SIGKILL {
+					t.Errorf("container wait status = %v, want killed by SIGKILL", res.ws)
+				}
 			case <-time.After(pollTimeout):
-				t.Fatalf("container with userspace-spinning task did not stop within %v", pollTimeout)
+				cont.Destroy()
+				t.Errorf("container with userspace-spinning task did not stop within %v", pollTimeout)
 			}
 		})
 	}
-}
-
-// countLines returns the number of lines in the file at path.
-func countLines(path string) (int, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	return strings.Count(string(b), "\n"), nil
 }
 
 // TestCheckpointRestoreHostname verifies that hostname is updated on restore
