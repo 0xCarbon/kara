@@ -9,7 +9,7 @@ package(
 go_template(
     name = "refs_template",
     srcs = [
-        "refs_template.go",
+        "refs_template.go.tmpl",
     ],
     opt_consts = [
         "enableLogging",
