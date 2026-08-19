@@ -154,3 +154,26 @@ go_test(
     srcs = ["node_test.go"],
     library = ":lisafs",
 )
+
+# plain_go_import_test proves that the plain-Go external-consumer surface
+# (pkg/lisafs, pkg/flipcall, pkg/fdchannel via the synthetic `go` branch
+# archive) builds and vets outside the repository. See the script header for
+# the environment it expects (a `go` toolchain on PATH and the three
+# golang.org/x modules in the ambient module cache).
+sh_test(
+    name = "plain_go_import_test",
+    srcs = ["plain_go_import_test.sh"],
+    args = [
+        "$(location //:gopath)",
+        "$(location //:go.mod)",
+        "$(location //:go.sum)",
+    ],
+    data = [
+        "//:gopath",
+        "//:go.mod",
+        "//:go.sum",
+    ],
+    tags = [
+        "manual",
+    ],
+)

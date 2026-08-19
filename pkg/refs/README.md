@@ -8,7 +8,7 @@ appropriately. For example, the filesystem has many reference-counted objects
 object persists while anything holds a reference on it and is destroyed once all
 references are dropped.
 
-We provide a template in `refs_template.go` that can be applied to most objects
+We provide a template in `refs_template.go.tmpl` that can be applied to most objects
 in need of reference counting. It contains a simple `Refs` struct that can be
 incremented and decremented, and once the reference count reaches zero, a
 destructor can be called. Note that there are some objects (e.g. `gofer.dentry`,

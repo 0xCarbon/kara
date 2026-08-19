@@ -68,3 +68,31 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "${{ github.event.pull_request.statuses_url }}"
+
+  # Proves the plain-Go external-consumer surface (pkg/lisafs, pkg/flipcall,
+  # pkg/fdchannel via the gopath archive / synthetic go branch) builds and
+  # vets out-of-tree, fully offline (GOPROXY=off).
+  plain-go-consumer:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v5
+    - uses: actions/setup-go@v6.0.0
+      with:
+        go-version-file: 'go.mod'
+    - name: bazel
+      run: |
+        sudo curl -fsSL -o /usr/local/bin/bazel \
+          https://github.com/bazelbuild/bazelisk/releases/download/v1.26.2/bazelisk-linux-amd64
+        sudo chmod +x /usr/local/bin/bazel
+        bazel --version
+    - name: warm module cache
+      run: go mod download golang.org/x/sys golang.org/x/exp golang.org/x/time
+    - name: plain-Go consumer build+vet
+      run: |
+        bazel test \
+          --test_env=HOME \
+          --test_env=PATH \
+          --test_output=streamed \
+          //pkg/lisafs:plain_go_import_test
