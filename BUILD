@@ -156,6 +156,9 @@ go_path(
 
         # Packages that are not dependencies of the above.
         "//pkg/sentry/kernel/memevent",
+        # The embeddable library mode (wave-06): not wired into any binary
+        # above; consumed by external embedders (oca) off the go branch.
+        "//runsc/library",
         "//pkg/sentry/socket/plugin/stack",
         "//pkg/tcpip/adapters/gonet",
         "//pkg/tcpip/faketime",

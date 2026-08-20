@@ -113,6 +113,33 @@ func TestClassifyCheckpointError(t *testing.T) {
 	}
 }
 
+// TestClassifyConnectTimeDeath pins the connect-time-death classification to
+// the actual dial-failure producers: a sandbox killed before (or while
+// waiting for) the checkpoint RPC fails at sandboxConnect, and that failure
+// must classify as SandboxDeath just like an EOF mid-RPC. The wave-06
+// library reference test exposed that connError's real text was not
+// matched, making the classification depend on connect-vs-call timing.
+func TestClassifyConnectTimeDeath(t *testing.T) {
+	s := &Sandbox{}
+	for _, cause := range []error{
+		syscall.ECONNREFUSED, // listener socket already gone
+		errors.New("dial unix /root/sbx/ctl.sock: connect: no such file or directory"), // unlinked path
+	} {
+		if got := classifyCheckpointError(s.connError(cause)); !IsSandboxDeath(got) {
+			t.Errorf("classifyCheckpointError(connError(%v)) = %v, want SandboxDeath", cause, got)
+		}
+	}
+	// Dial failures that do not pass through connError.
+	for _, raw := range []string{
+		"no control socket found for sandbox \"sbx\"",
+		"failed to open socket at \"/root/sbx/ctl.sock\"",
+	} {
+		if got := classifyCheckpointError(errors.New(raw)); !IsSandboxDeath(got) {
+			t.Errorf("classifyCheckpointError(%q) = %v, want SandboxDeath", raw, got)
+		}
+	}
+}
+
 // TestClassifyNil ensures the helper is nil-safe.
 func TestClassifyNil(t *testing.T) {
 	if got := classifyCheckpointError(nil); got != nil {
