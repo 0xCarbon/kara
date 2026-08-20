@@ -19,6 +19,7 @@ import (
 	"os"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/config"
@@ -35,6 +36,14 @@ type Options struct {
 	// (runsc --root). Empty uses config.DefaultRootDir(). The directory is
 	// created on first use.
 	Root string
+
+	// ExePath is the path to the runsc binary used to spawn the sandbox
+	// and gofer processes (specutils.ExePath). The default
+	// "/proc/self/exe" re-executes the EMBEDDING process as the sentry —
+	// embedders that are not the runsc binary itself must set this to a
+	// real runsc binary path (the reference test does via the test
+	// harness).
+	ExePath string
 
 	// Platform is the sentry platform: "systrap" (default), "ptrace",
 	// "kvm". It participates in the restore-compatibility key.
@@ -116,6 +125,9 @@ func New(opts Options) (*Runtime, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid runtime configuration: %w", err)
 	}
+	if opts.ExePath != "" {
+		specutils.ExePath = opts.ExePath
+	}
 	return &Runtime{conf: conf}, nil
 }
 
@@ -194,8 +206,14 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 		ExecFile:           opts.ExecFile,
 		FSRestoreImagePath: opts.FSRestoreImagePath,
 		FSRestoreDirect:    opts.FSRestoreDirect,
-		IOFDs:              fileFDs(opts.GoferIOFiles),
-		EgressFD:           fileFD(opts.EgressFile),
+	}
+	ioFDs, err := fileFDs(opts.GoferIOFiles)
+	if err != nil {
+		return nil, fmt.Errorf("library: acquiring gofer IO files: %w", err)
+	}
+	args.IOFDs = ioFDs
+	if args.EgressFD, err = fileFD(opts.EgressFile); err != nil {
+		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
 	}
 	c, err := container.New(r.conf, args)
 	if err != nil {
@@ -342,8 +360,14 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 		FSRestoreDirect:   opts.Direct,
 		CheckpointDirPath: opts.ImagePath,
 		SplitFSRestore:    opts.SplitFSRestore,
-		IOFDs:             fileFDs(opts.GoferIOFiles),
-		EgressFD:          fileFD(opts.EgressFile),
+	}
+	ioFDs, err := fileFDs(opts.GoferIOFiles)
+	if err != nil {
+		return nil, fmt.Errorf("library: acquiring gofer IO files: %w", err)
+	}
+	args.IOFDs = ioFDs
+	if args.EgressFD, err = fileFD(opts.EgressFile); err != nil {
+		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
 	}
 	c, err = container.New(r.conf, args)
 	if err != nil {
@@ -363,23 +387,47 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 // fileFDs converts donated files to the raw descriptor list container.Args
 // takes. Descriptor 0 is preserved (an explicit 0 is a valid donation; the
 // zero-value-vs-unset distinction is made by slice length, not FD number).
-func fileFDs(files []*os.File) []int {
+func fileFDs(files []*os.File) ([]int, error) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 	fds := make([]int, 0, len(files))
 	for _, f := range files {
-		fds = append(fds, int(f.Fd()))
+		fd, err := ownFD(f)
+		if err != nil {
+			for _, d := range fds {
+				unix.Close(d)
+			}
+			return nil, err
+		}
+		fds = append(fds, fd)
 	}
-	return fds
+	return fds, nil
 }
 
 // fileFD converts a single donated file, preserving descriptor 0; nil stays
 // nil (unset).
-func fileFD(f *os.File) *int {
+func fileFD(f *os.File) (*int, error) {
 	if f == nil {
-		return nil
+		return nil, nil
 	}
-	fd := int(f.Fd())
-	return &fd
+	fd, err := ownFD(f)
+	if err != nil {
+		return nil, err
+	}
+	return &fd, nil
+}
+
+// ownFD extracts the file descriptor of f and transfers ownership to the
+// library: the caller's *os.File is closed (disarming its finalizer), and a
+// dup of the descriptor is returned so the runtime's DonateAndClose path is
+// the single authoritative closer. Without this, the caller's GC finalizer
+// can double-close a descriptor number the runtime has already reused.
+func ownFD(f *os.File) (int, error) {
+	fd, err := unix.Dup(int(f.Fd()))
+	if err != nil {
+		return -1, fmt.Errorf("dup for donation: %w", err)
+	}
+	f.Close()
+	return fd, nil
 }

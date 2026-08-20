@@ -170,8 +170,9 @@ func (c *Container) Checkpoint(opts CheckpointOptions) (*CheckpointResult, error
 // this container and no existing-container adoption happens (this IS the
 // existing container).
 //
-// On failure the container is destroyed unless it was adopted via
-// Runtime.Load (mirroring Runtime.Restore's cleanup contract).
+// On failure, the caller is responsible for destroying the container
+// (call Destroy) — the library does not auto-destroy here, only
+// Runtime.Restore (the fresh-create path) cleans up on failure.
 func (c *Container) Restore(opts RestoreOptions) error {
 	if opts.ImagePath == "" {
 		return fmt.Errorf("library: restoring container %q: ImagePath is required", c.cont.ID)

@@ -76,11 +76,15 @@
 //	  call provides under the same number (and container-name annotation).
 //	ExecFile:    host executable file for the container init process.
 //
-// OWNERSHIP: donated files are consumed. runsc donates the descriptors into
-// the sandbox process and closes them in this process
-// (donation.DonateAndClose) once creation succeeds. Callers must drop their
-// references without using or closing them afterwards. On failure the files
-// remain owned by the caller.
+// OWNERSHIP: donated files are consumed. The library dups each descriptor
+// and closes the caller's *os.File (disarming its finalizer) at Create or
+// Restore time; the runtime then donates the dup and closes it
+// (donation.DonateAndClose for gofer/egress connections) or transfers it
+// (DonateAndTransferCustomFiles for PassFiles) once creation succeeds.
+// Callers must not use or close the files after passing them (the library
+// already did). On failure before the sandbox spawn, the dup is closed by
+// the library and the caller's file was already closed — the descriptor is
+// deterministically released either way.
 //
 // # Concurrency
 //
