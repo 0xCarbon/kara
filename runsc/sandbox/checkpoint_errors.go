@@ -133,7 +133,7 @@ func classifyCheckpointError(err error) error {
 		strings.Contains(msg, "no control socket found") ||
 		strings.Contains(msg, "connecting to control server") ||
 		strings.Contains(msg, "failed to open socket at") ||
-		strings.Contains(msg, "connecting to sandbox") {
+		strings.Contains(msg, "connecting to sandbox: connection refused") {
 		return &SandboxDeath{Err: err}
 	}
 	return err

@@ -154,9 +154,13 @@ jobs:
     steps:
       - name: Resolve oca ref and check secrets
         id: refs
+        env:
+          # Pass via environment to avoid shell injection from ref content
+          OCA_REF_INPUT: ${{ github.event.inputs.oca_ref }}
+          OCA_REF_PAYLOAD: ${{ github.event.client_payload.ref }}
         run: |
           set -euo pipefail
-          REF="${{ github.event.inputs.oca_ref }}${{ github.event.client_payload.ref }}"
+          REF="${OCA_REF_INPUT}${OCA_REF_PAYLOAD}"
           if [ -z "$REF" ]; then REF="main"; fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "Resolved oca ref: $REF"

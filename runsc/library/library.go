@@ -81,6 +81,10 @@ type Options struct {
 // configuration; share it across goroutines; build Containers from it.
 type Runtime struct {
 	conf *config.Config
+	// exePath is the runsc binary for sandbox/gofer spawns; empty means
+	// the specutils default (/proc/self/exe). Scoped per-Runtime (not the
+	// specutils global) so concurrent Runtimes do not interfere.
+	exePath string
 }
 
 // New validates opts and returns a Runtime. It never touches the network,
@@ -125,10 +129,7 @@ func New(opts Options) (*Runtime, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid runtime configuration: %w", err)
 	}
-	if opts.ExePath != "" {
-		specutils.ExePath = opts.ExePath
-	}
-	return &Runtime{conf: conf}, nil
+	return &Runtime{conf: conf, exePath: opts.ExePath}, nil
 }
 
 // Config returns the runsc configuration this runtime was built with. The
@@ -213,10 +214,17 @@ func (r *Runtime) Create(opts CreateOptions) (*Container, error) {
 	}
 	args.IOFDs = ioFDs
 	if args.EgressFD, err = fileFD(opts.EgressFile); err != nil {
+		closeFDs(ioFDs)
 		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
+	}
+	if r.exePath != "" {
+		prev := specutils.ExePath
+		specutils.ExePath = r.exePath
+		defer func() { specutils.ExePath = prev }()
 	}
 	c, err := container.New(r.conf, args)
 	if err != nil {
+		closeFDs(filterNil(args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q: %w", opts.ID, err)
 	}
 	return &Container{rt: r, cont: c}, nil
@@ -367,10 +375,17 @@ func (r *Runtime) Restore(opts RestoreOptions) (*Container, error) {
 	}
 	args.IOFDs = ioFDs
 	if args.EgressFD, err = fileFD(opts.EgressFile); err != nil {
+		closeFDs(ioFDs)
 		return nil, fmt.Errorf("library: acquiring egress file: %w", err)
+	}
+	if r.exePath != "" {
+		prev := specutils.ExePath
+		specutils.ExePath = r.exePath
+		defer func() { specutils.ExePath = prev }()
 	}
 	c, err = container.New(r.conf, args)
 	if err != nil {
+		closeFDs(filterNil(args.EgressFD, ioFDs))
 		return nil, fmt.Errorf("library: creating container %q for restore: %w", opts.ID, err)
 	}
 	lc := &Container{rt: r, cont: c}
@@ -430,4 +445,21 @@ func ownFD(f *os.File) (int, error) {
 	}
 	f.Close()
 	return fd, nil
+}
+
+// closeFDs closes the given descriptors, ignoring errors (cleanup path).
+func closeFDs(fds []int) {
+	for _, fd := range fds {
+		unix.Close(fd)
+	}
+}
+
+// filterNil returns the FD list with a nil pointer flattened.
+func filterNil(egress *int, ioFDs []int) []int {
+	all := make([]int, 0, len(ioFDs)+1)
+	if egress != nil {
+		all = append(all, *egress)
+	}
+	all = append(all, ioFDs...)
+	return all
 }
